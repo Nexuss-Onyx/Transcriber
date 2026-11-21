@@ -233,7 +233,7 @@ export function UploadAudioModal({
         </label>
 
         <label className="mt-3.5 flex cursor-pointer items-center justify-between text-xs text-slate-700 dark:text-slate-300">
-          <span>Auto-play audio with live captions once first 15s is ready</span>
+          <span>Auto-open playback once all workers & first 15s segment are ready</span>
           <input
             type="checkbox"
             checked={autoPlay}

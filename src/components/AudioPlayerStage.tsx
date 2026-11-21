@@ -133,13 +133,18 @@ export function AudioPlayerStage({
 
   const isBuffering = Boolean(chunkProgress?.isBuffering);
   const activeWorkerCount = chunkProgress?.activeChunkIndices.length ?? 0;
+  const totalWorkers = chunkProgress?.workerCount ?? 5;
+  const readyWorkers = chunkProgress?.readyWorkers ?? 0;
+  const preRollStage = chunkProgress?.preRollStage ?? "transcribing";
 
   const statusText = !chunkProgress
     ? ""
     : isBuffering
-      ? chunkProgress.totalChunks > 0
-        ? `Pre-buffering ${chunkProgress.completedChunks}/${chunkProgress.totalChunks} segments (15s) · 5 workers`
-        : "Segmenting audio into 15s clips..."
+      ? preRollStage === "segmenting"
+        ? "Segmenting audio into 15s clips..."
+        : preRollStage === "connecting"
+          ? `Transcribing · Readying workers (${readyWorkers}/${totalWorkers})...`
+          : `Transcribing first segment (${readyWorkers}/${totalWorkers} workers ready)`
       : chunkProgress.completedChunks >= chunkProgress.totalChunks &&
           chunkProgress.totalChunks > 0
         ? `${chunkProgress.completedChunks}/${chunkProgress.totalChunks} segments (15s) · Complete`
@@ -211,12 +216,14 @@ export function AudioPlayerStage({
         {showCaptions && (
           <div className="mb-3 flex min-h-[68px] items-center justify-center rounded-lg border border-slate-800 bg-slate-900/90 px-5 py-3 text-center">
             {isBuffering && chunkProgress ? (
-              <div className="flex items-center gap-2 text-xs text-slate-300">
-                <Loader2 className="h-3.5 w-3.5 animate-spin text-amber-400" />
+              <div className="flex items-center gap-2.5 text-xs text-slate-200">
+                <Loader2 className="h-4 w-4 animate-spin text-rose-400" />
                 <span>
-                  {chunkProgress.totalChunks > 0
-                    ? `Preparing 5 workers on initial 15s segments (${chunkProgress.completedChunks}/${Math.min(3, chunkProgress.totalChunks)} buffered)...`
-                    : "Slicing audio into 15-second segments..."}
+                  {preRollStage === "segmenting"
+                    ? "Transcribing · Segmenting audio into 15-second clips..."
+                    : preRollStage === "connecting"
+                      ? `Transcribing · Preparing ${totalWorkers} Live workers (${readyWorkers}/${totalWorkers} ready)...`
+                      : `Transcribing first 15s segment (${readyWorkers}/${totalWorkers} workers active) · Audio will start automatically when ready...`}
                 </span>
               </div>
             ) : activeSegment ? (
@@ -264,6 +271,7 @@ export function AudioPlayerStage({
         <div className="group relative mb-2.5">
           <div
             onClick={(e) => {
+              if (isBuffering) return;
               const rect = e.currentTarget.getBoundingClientRect();
               const ratio = Math.max(
                 0,
@@ -271,7 +279,9 @@ export function AudioPlayerStage({
               );
               onSeekToMs(Math.round(ratio * safeDuration));
             }}
-            className="relative h-2.5 w-full cursor-pointer overflow-hidden rounded-full bg-slate-800"
+            className={`relative h-2.5 w-full overflow-hidden rounded-full bg-slate-800 ${
+              isBuffering ? "cursor-not-allowed opacity-75" : "cursor-pointer"
+            }`}
           >
             {/* Active 15s chunk blocks currently being transcribed by live workers */}
             {chunkProgress &&
@@ -339,9 +349,10 @@ export function AudioPlayerStage({
           <div className="flex items-center gap-1.5">
             <button
               type="button"
+              disabled={isBuffering}
               onClick={togglePlay}
               aria-label={isPlaying ? "Pause audio and transcription" : "Play audio and transcription"}
-              className="flex h-8 w-8 items-center justify-center rounded-md bg-white text-slate-950 transition-colors hover:bg-slate-200"
+              className="flex h-8 w-8 items-center justify-center rounded-md bg-white text-slate-950 transition-colors hover:bg-slate-200 disabled:cursor-not-allowed disabled:opacity-45"
             >
               {isPlaying ? (
                 <Pause className="h-4 w-4 fill-current" />
@@ -351,26 +362,29 @@ export function AudioPlayerStage({
             </button>
             <button
               type="button"
+              disabled={isBuffering}
               onClick={onStopAudio}
               aria-label="Stop audio and transcription"
-              className="flex h-8 w-8 items-center justify-center rounded-md bg-slate-800 text-slate-200 transition-colors hover:bg-slate-700 hover:text-white"
+              className="flex h-8 w-8 items-center justify-center rounded-md bg-slate-800 text-slate-200 transition-colors hover:bg-slate-700 hover:text-white disabled:cursor-not-allowed disabled:opacity-45"
             >
               <Square className="h-3.5 w-3.5 fill-current" />
             </button>
             <button
               type="button"
+              disabled={isBuffering}
               onClick={() => skipBy(-5)}
               aria-label="Back 5 seconds"
-              className="flex h-8 items-center gap-1 rounded-md px-2 text-xs text-slate-300 hover:bg-slate-800 hover:text-white"
+              className="flex h-8 items-center gap-1 rounded-md px-2 text-xs text-slate-300 hover:bg-slate-800 hover:text-white disabled:cursor-not-allowed disabled:opacity-45"
             >
               <RotateCcw className="h-3.5 w-3.5" />
               <span>5s</span>
             </button>
             <button
               type="button"
+              disabled={isBuffering}
               onClick={() => skipBy(15)}
               aria-label="Forward 15 seconds"
-              className="flex h-8 items-center gap-1 rounded-md px-2 text-xs text-slate-300 hover:bg-slate-800 hover:text-white"
+              className="flex h-8 items-center gap-1 rounded-md px-2 text-xs text-slate-300 hover:bg-slate-800 hover:text-white disabled:cursor-not-allowed disabled:opacity-45"
             >
               <RotateCw className="h-3.5 w-3.5" />
               <span>15s</span>

@@ -738,12 +738,15 @@ export default function App() {
       });
 
       try {
+        isPreBufferingRef.current = true;
         setChunkProgress({
           totalChunks: 0,
           completedChunks: 0,
           completedChunkIndices: [],
           activeChunkIndices: [],
           workerCount: 5,
+          readyWorkers: 0,
+          preRollStage: "segmenting",
           isBuffering: true,
           chunkDurationSec: 15,
           isProcessing: true,
@@ -770,9 +773,12 @@ export default function App() {
         );
 
         const workerCount = Math.min(5, Math.max(1, chunks.length));
-        isPreBufferingRef.current = autoPlay && chunks.length > 0;
-        let autoPlayTriggered = !autoPlay;
-        const preBufferTarget = Math.min(3, chunks.length);
+        isPreBufferingRef.current = chunks.length > 0;
+        let preRollCompleted = chunks.length === 0;
+        let readyWorkerCount = 0;
+        let allWorkersReady = false;
+        let preRollStage: "segmenting" | "connecting" | "transcribing" =
+          "connecting";
 
         setChunkProgress({
           totalChunks: chunks.length,
@@ -780,10 +786,12 @@ export default function App() {
           completedChunkIndices: [],
           activeChunkIndices: [],
           workerCount,
+          readyWorkers: 0,
+          preRollStage,
           isBuffering: isPreBufferingRef.current,
           chunkDurationSec: 15,
           isProcessing: true,
-          isPaused: !autoPlay,
+          isPaused: false,
           isAudioEnded: false,
         });
 
@@ -1032,6 +1040,8 @@ export default function App() {
               ? []
               : Array.from(activeChunksSet).sort((a, b) => a - b),
             workerCount,
+            readyWorkers: readyWorkerCount,
+            preRollStage,
             isBuffering: bufferingNow,
             chunkDurationSec: 15,
             isProcessing: completedSet.size < chunks.length && !fatalError,
@@ -1043,25 +1053,26 @@ export default function App() {
 
         const maybeStartAutoPlayback = async () => {
           if (
-            autoPlayTriggered ||
+            preRollCompleted ||
             !isPreBufferingRef.current ||
             abortController.signal.aborted
           ) {
             return;
           }
-          if (
-            completedSet.has(0) &&
-            completedSet.size >= preBufferTarget &&
-            audioElRef.current
-          ) {
-            autoPlayTriggered = true;
+          if (allWorkersReady && completedSet.has(0)) {
+            preRollCompleted = true;
             isPreBufferingRef.current = false;
-            try {
-              await audioElRef.current.play();
-              audioPlaybackEndedRef.current = false;
-              isAudioPlayingRef.current = true;
-              setIsAudioPlaying(true);
-            } catch {
+            if (autoPlay && audioElRef.current) {
+              try {
+                await audioElRef.current.play();
+                audioPlaybackEndedRef.current = false;
+                isAudioPlayingRef.current = true;
+                setIsAudioPlaying(true);
+              } catch {
+                isAudioPlayingRef.current = false;
+                setIsAudioPlaying(false);
+              }
+            } else {
               isAudioPlayingRef.current = false;
               setIsAudioPlaying(false);
             }
@@ -1123,85 +1134,121 @@ export default function App() {
           );
         };
 
-        const runWorker = async (workerId: number) => {
-          if (workerId > 0) {
-            await new Promise((r) => setTimeout(r, workerId * 75));
-          }
-
-          while (
-            !abortController.signal.aborted &&
-            !fatalError &&
-            completedSet.size < chunks.length
-          ) {
-            const shouldActivelyRun =
-              isPreBufferingRef.current ||
-              isAudioPlayingRef.current ||
-              audioPlaybackEndedRef.current;
-
-            if (!shouldActivelyRun) {
-              if (workerId === 0) {
-                setInterimText("");
-                syncProgressUI();
-              }
-              await new Promise((r) => setTimeout(r, 150));
-              continue;
-            }
-
-            const targetIdx = claimNextChunk();
-            if (targetIdx === null) {
-              if (chunkStates.every((st) => st === "done")) {
-                break;
-              }
-              await new Promise((r) => setTimeout(r, 150));
-              continue;
-            }
-
-            const chunk = chunks[targetIdx];
-            activeChunksSet.add(targetIdx);
-            syncProgressUI();
-
-            if (!chunk.hasAudioSignal || chunk.pcmPacketsBase64.length === 0) {
-              activeChunksSet.delete(targetIdx);
-              chunkStates[targetIdx] = "done";
-              completedSet.add(targetIdx);
-              await maybeStartAutoPlayback();
+        // Step 2: Pre-warm ALL workers concurrently so all Live sessions are ready before transcribing
+        const preWarmedConns: Array<Awaited<ReturnType<typeof openLiveWs>> | null> =
+          await Promise.all(
+            Array.from({ length: workerCount }, async () => {
+              const conn = await openLiveWs(lockedAutoLang);
+              readyWorkerCount += 1;
               syncProgressUI();
-              continue;
-            }
+              return conn;
+            })
+          );
 
-            let conn: Awaited<ReturnType<typeof openLiveWs>> | null = null;
-            let interruptedByPause = false;
-            let packetsSent = 0;
-            let chunkError: string | null = null;
-            let turnCompleteReceived = false;
-            let closeCode: number | undefined;
-            const chunkFinalParts: string[] = [];
-            let latestInterim = "";
-            let detectedLang: string | undefined;
+        if (abortController.signal.aborted) {
+          preWarmedConns.forEach((c) => closeLiveConn(c));
+          return;
+        }
 
-            try {
-              const initialHint = lockedAutoLang;
-              const prevSourceText =
-                cfg.mode === "SMART" && targetIdx > 0 && rawChunkTexts[targetIdx - 1]
-                  ? rawChunkTexts[targetIdx - 1].slice(-220)
-                  : undefined;
-              try {
-                conn = await openLiveWs(initialHint, prevSourceText);
-              } catch (openErr) {
-                // If lockedAutoLang wasn't accepted, safely fall back to auto-detect
-                if (
-                  initialHint &&
-                  cfg.languageCode === "auto" &&
-                  !isFatalConfigError(
-                    openErr instanceof Error ? openErr.message : String(openErr)
-                  )
-                ) {
-                  lockedAutoLang = null;
-                  conn = await openLiveWs(null, prevSourceText);
-                } else {
-                  throw openErr;
+        allWorkersReady = true;
+        preRollStage = "transcribing";
+        syncProgressUI();
+
+        const runWorker = async (workerId: number) => {
+          let pendingPreWarmedConn = preWarmedConns[workerId] ?? null;
+          preWarmedConns[workerId] = null;
+
+          try {
+            while (
+              !abortController.signal.aborted &&
+              !fatalError &&
+              completedSet.size < chunks.length
+            ) {
+              const shouldActivelyRun =
+                isPreBufferingRef.current ||
+                isAudioPlayingRef.current ||
+                audioPlaybackEndedRef.current;
+
+              if (!shouldActivelyRun) {
+                if (workerId === 0) {
+                  setInterimText("");
+                  syncProgressUI();
                 }
+                await new Promise((r) => setTimeout(r, 150));
+                continue;
               }
+
+              const targetIdx = claimNextChunk();
+              if (targetIdx === null) {
+                if (chunkStates.every((st) => st === "done")) {
+                  break;
+                }
+                await new Promise((r) => setTimeout(r, 150));
+                continue;
+              }
+
+              const chunk = chunks[targetIdx];
+              activeChunksSet.add(targetIdx);
+              syncProgressUI();
+
+              if (!chunk.hasAudioSignal || chunk.pcmPacketsBase64.length === 0) {
+                activeChunksSet.delete(targetIdx);
+                chunkStates[targetIdx] = "done";
+                completedSet.add(targetIdx);
+                await maybeStartAutoPlayback();
+                syncProgressUI();
+                continue;
+              }
+
+              let conn: Awaited<ReturnType<typeof openLiveWs>> | null = null;
+              let interruptedByPause = false;
+              let packetsSent = 0;
+              let chunkError: string | null = null;
+              let turnCompleteReceived = false;
+              let closeCode: number | undefined;
+              const chunkFinalParts: string[] = [];
+              let latestInterim = "";
+              let detectedLang: string | undefined;
+
+              try {
+                if (
+                  pendingPreWarmedConn &&
+                  pendingPreWarmedConn.ws.readyState === WebSocket.OPEN
+                ) {
+                  conn = pendingPreWarmedConn;
+                  pendingPreWarmedConn = null;
+                } else {
+                  if (pendingPreWarmedConn) {
+                    closeLiveConn(pendingPreWarmedConn);
+                    pendingPreWarmedConn = null;
+                  }
+                  const initialHint = lockedAutoLang;
+                  const prevSourceText =
+                    cfg.mode === "SMART" &&
+                    targetIdx > 0 &&
+                    rawChunkTexts[targetIdx - 1]
+                      ? rawChunkTexts[targetIdx - 1].slice(-220)
+                      : undefined;
+                  try {
+                    conn = await openLiveWs(initialHint, prevSourceText);
+                  } catch (openErr) {
+                    // If lockedAutoLang wasn't accepted, safely fall back to auto-detect
+                    if (
+                      initialHint &&
+                      cfg.languageCode === "auto" &&
+                      !isFatalConfigError(
+                        openErr instanceof Error
+                          ? openErr.message
+                          : String(openErr)
+                      )
+                    ) {
+                      lockedAutoLang = null;
+                      conn = await openLiveWs(null, prevSourceText);
+                    } else {
+                      throw openErr;
+                    }
+                  }
+                }
 
               let onActivitySignal: (() => void) | null = null;
               let onFinishSignal: (() => void) | null = null;
@@ -1420,6 +1467,12 @@ export default function App() {
             }
 
             syncProgressUI();
+            }
+          } finally {
+            if (pendingPreWarmedConn) {
+              closeLiveConn(pendingPreWarmedConn);
+              pendingPreWarmedConn = null;
+            }
           }
         };
 
@@ -1441,6 +1494,7 @@ export default function App() {
         }
       } catch (err) {
         if (abortController.signal.aborted) return;
+        isPreBufferingRef.current = false;
         setInterimText("");
         const msg =
           err instanceof Error
@@ -1464,6 +1518,7 @@ export default function App() {
   );
 
   const handleSeekAudioMs = useCallback((ms: number) => {
+    if (isPreBufferingRef.current) return;
     const audio = audioElRef.current;
     if (!audio) return;
     uploadSeekSeqRef.current += 1;
@@ -1486,6 +1541,7 @@ export default function App() {
   }, []);
 
   const handleStopAudio = useCallback(() => {
+    if (isPreBufferingRef.current) return;
     const audio = audioElRef.current;
     uploadSeekSeqRef.current += 1;
     audioPlaybackEndedRef.current = false;
@@ -1526,6 +1582,7 @@ export default function App() {
       }
       e.preventDefault();
       if (uploadedAudio?.sessionId === activeSessionId && audioElRef.current) {
+        if (isPreBufferingRef.current) return;
         if (audioElRef.current.paused) {
           void audioElRef.current.play().catch(() => {});
         } else {
@@ -2002,9 +2059,9 @@ export default function App() {
               <div className="flex items-center gap-2 text-xs font-medium whitespace-nowrap shrink-0">
                 {chunkProgress?.isBuffering ? (
                   <>
-                    <span className="h-2 w-2 rounded-full bg-amber-400 animate-pulse" />
-                    <span className="text-amber-600 dark:text-amber-400">
-                      Preparing Workers
+                    <span className="h-2 w-2 rounded-full bg-rose-500 animate-pulse" />
+                    <span className="text-rose-600 dark:text-rose-400">
+                      Transcribing...
                     </span>
                   </>
                 ) : isAudioPlaying ? (
@@ -2037,15 +2094,23 @@ export default function App() {
               </div>
               <div className="text-xs text-slate-500 dark:text-slate-400 tabular-nums truncate">
                 {chunkProgress
-                  ? chunkProgress.totalChunks > 0
-                    ? `${chunkProgress.completedChunks}/${chunkProgress.totalChunks} segments (15s)`
-                    : "Slicing 15s segments..."
+                  ? chunkProgress.isBuffering
+                    ? chunkProgress.preRollStage === "segmenting"
+                      ? "Segmenting audio into 15s clips..."
+                      : chunkProgress.preRollStage === "connecting"
+                        ? `Readying ${chunkProgress.readyWorkers ?? 0}/${chunkProgress.workerCount ?? 5} Live workers...`
+                        : `Finishing segment 1 (${chunkProgress.readyWorkers ?? 0}/${chunkProgress.workerCount ?? 5} workers ready)`
+                    : chunkProgress.totalChunks > 0
+                      ? `${chunkProgress.completedChunks}/${chunkProgress.totalChunks} segments (15s)`
+                      : "Slicing 15s segments..."
                   : "Audio loaded"}
               </div>
               <div className="flex items-center gap-2 shrink-0">
                 <button
                   type="button"
+                  disabled={Boolean(chunkProgress?.isBuffering)}
                   onClick={() => {
+                    if (isPreBufferingRef.current) return;
                     const audio = audioElRef.current;
                     if (!audio) return;
                     if (audio.paused) {
@@ -2054,7 +2119,7 @@ export default function App() {
                       audio.pause();
                     }
                   }}
-                  className="flex h-10 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3.5 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700 whitespace-nowrap shrink-0"
+                  className="flex h-10 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3.5 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-45 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700 whitespace-nowrap shrink-0"
                 >
                   {isAudioPlaying ? (
                     <>
@@ -2070,8 +2135,9 @@ export default function App() {
                 </button>
                 <button
                   type="button"
+                  disabled={Boolean(chunkProgress?.isBuffering)}
                   onClick={handleStopAudio}
-                  className="flex h-10 items-center gap-2 rounded-lg bg-slate-900 px-4 text-xs font-medium text-white transition-colors hover:bg-slate-800 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-200 whitespace-nowrap shrink-0"
+                  className="flex h-10 items-center gap-2 rounded-lg bg-slate-900 px-4 text-xs font-medium text-white transition-colors hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-45 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-200 whitespace-nowrap shrink-0"
                 >
                   <Square className="h-3.5 w-3.5 fill-current" />
                   <span>Stop</span>

@@ -382,13 +382,11 @@ export function TranscriptStream({
               <Loader2 className="h-3.5 w-3.5 animate-spin text-rose-500" />
               <span>
                 {chunkProgress.isBuffering
-                  ? chunkProgress.totalChunks > 0
-                    ? `Pre-buffering 5 workers on 15s segments ${
-                        chunkProgress.activeChunkIndices
-                          .map((i) => i + 1)
-                          .join(", ") || "1"
-                      } before playback starts...`
-                    : "Slicing audio into 15-second segments..."
+                  ? chunkProgress.preRollStage === "segmenting"
+                    ? "Transcribing · Segmenting audio into 15-second clips..."
+                    : chunkProgress.preRollStage === "connecting"
+                      ? `Transcribing · Preparing ${chunkProgress.workerCount ?? 5} Live workers (${chunkProgress.readyWorkers ?? 0}/${chunkProgress.workerCount ?? 5} ready)...`
+                      : `Transcribing first 15s segment (${chunkProgress.readyWorkers ?? 0}/${chunkProgress.workerCount ?? 5} workers ready) · Playback opens once ready...`
                   : `${chunkProgress.activeChunkIndices.length} ${
                       chunkProgress.activeChunkIndices.length === 1
                         ? "audio worker"

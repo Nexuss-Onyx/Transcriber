@@ -41,6 +41,8 @@ export interface UploadedChunkProgress {
   completedChunkIndices: number[];
   activeChunkIndices: number[];
   workerCount?: number;
+  readyWorkers?: number;
+  preRollStage?: "segmenting" | "connecting" | "transcribing";
   isBuffering?: boolean;
   chunkDurationSec: number;
   isProcessing: boolean;
