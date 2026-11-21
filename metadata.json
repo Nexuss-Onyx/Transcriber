@@ -1,0 +1,6 @@
+{
+  "name": "Transcribe Live",
+  "description": "Real-time speech-to-text transcription workspace powered by Gemini 3.5 Transcribe Live.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
