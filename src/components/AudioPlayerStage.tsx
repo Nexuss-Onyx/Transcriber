@@ -132,8 +132,8 @@ export function AudioPlayerStage({
     !chunkProgress?.isPaused;
 
   const isBuffering = Boolean(chunkProgress?.isBuffering);
-  const activeWorkerCount = chunkProgress?.activeChunkIndices.length ?? 0;
-  const totalWorkers = chunkProgress?.workerCount ?? 5;
+  const hasActiveSegment = (chunkProgress?.activeChunkIndices.length ?? 0) > 0;
+  const totalWorkers = chunkProgress?.workerCount ?? 3;
   const readyWorkers = chunkProgress?.readyWorkers ?? 0;
   const preRollStage = chunkProgress?.preRollStage ?? "transcribing";
 
@@ -150,14 +150,14 @@ export function AudioPlayerStage({
         ? `${chunkProgress.completedChunks}/${chunkProgress.totalChunks} segments (15s) · Complete`
         : isPlaying
           ? `${chunkProgress.completedChunks}/${chunkProgress.totalChunks} segments (15s) · ${
-              activeWorkerCount > 0
-                ? `${activeWorkerCount} ${activeWorkerCount === 1 ? "worker" : "workers"} live`
-                : "Live"
+              hasActiveSegment
+                ? `${totalWorkers} workers on segment ${chunkProgress.activeChunkIndices[0] + 1}`
+                : "Synced"
             }`
           : isCompletingAfterEnd
             ? `${chunkProgress.completedChunks}/${chunkProgress.totalChunks} segments (15s) · ${
-                activeWorkerCount > 0
-                  ? `${activeWorkerCount} ${activeWorkerCount === 1 ? "worker" : "workers"} finishing`
+                hasActiveSegment
+                  ? `${totalWorkers} workers finishing segment ${chunkProgress.activeChunkIndices[0] + 1}`
                   : "Completing..."
               }`
             : `${chunkProgress.completedChunks}/${chunkProgress.totalChunks} segments (15s) · Paused`;

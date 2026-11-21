@@ -385,13 +385,9 @@ export function TranscriptStream({
                   ? chunkProgress.preRollStage === "segmenting"
                     ? "Transcribing · Segmenting audio into 15-second clips..."
                     : chunkProgress.preRollStage === "connecting"
-                      ? `Transcribing · Preparing ${chunkProgress.workerCount ?? 5} Live workers (${chunkProgress.readyWorkers ?? 0}/${chunkProgress.workerCount ?? 5} ready)...`
-                      : `Transcribing first 15s segment (${chunkProgress.readyWorkers ?? 0}/${chunkProgress.workerCount ?? 5} workers ready) · Playback opens once ready...`
-                  : `${chunkProgress.activeChunkIndices.length} ${
-                      chunkProgress.activeChunkIndices.length === 1
-                        ? "audio worker"
-                        : "audio workers"
-                    } transcribing 15s segments ${chunkProgress.activeChunkIndices
+                      ? `Transcribing · Preparing ${chunkProgress.workerCount ?? 3} Live workers (${chunkProgress.readyWorkers ?? 0}/${chunkProgress.workerCount ?? 3} ready)...`
+                      : `Transcribing first 15s segment (${chunkProgress.readyWorkers ?? 0}/${chunkProgress.workerCount ?? 3} workers focused) · Playback opens once ready...`
+                  : `${chunkProgress.workerCount ?? 3} workers focusing on 15s segment ${chunkProgress.activeChunkIndices
                       .map((i) => i + 1)
                       .join(", ")} of ${chunkProgress.totalChunks}...`}
               </span>

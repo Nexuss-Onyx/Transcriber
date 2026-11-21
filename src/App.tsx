@@ -38,6 +38,8 @@ import {
   downsampleBuffer,
   float32ToBase64Pcm16,
   formatDuration,
+  hasMixedLatinWithNonLatin,
+  reconcileFocusedTranscripts,
   scriptFamilyToBcp47,
   sliceAudioFileIntoLiveChunks,
   splitTextIntoTimedCues,
@@ -744,7 +746,7 @@ export default function App() {
           completedChunks: 0,
           completedChunkIndices: [],
           activeChunkIndices: [],
-          workerCount: 5,
+          workerCount: 3,
           readyWorkers: 0,
           preRollStage: "segmenting",
           isBuffering: true,
@@ -772,7 +774,7 @@ export default function App() {
             : prev
         );
 
-        const workerCount = Math.min(5, Math.max(1, chunks.length));
+        const workerCount = chunks.length > 0 ? 3 : 0;
         isPreBufferingRef.current = chunks.length > 0;
         let preRollCompleted = chunks.length === 0;
         let readyWorkerCount = 0;
@@ -799,8 +801,12 @@ export default function App() {
           cfg.languageCode === "auto" ? null : cfg.languageCode;
         let lockedScriptFamily: string | null = null;
 
-        // Isolated Live WebSocket session helper (1 independent session per 15s segment)
-        const openLiveWs = (langHint: string | null, sourceContext?: string) =>
+        // Isolated Live WebSocket session helper (1 independent session per pass)
+        const openLiveWs = (
+          langHint: string | null,
+          sourceContext?: string,
+          overrideMode?: "VERBATIM" | "SMART"
+        ) =>
           new Promise<{
             ws: WebSocket;
             setChunkHandlers: (handlers: {
@@ -816,6 +822,7 @@ export default function App() {
             const ws = new WebSocket(
               `${protocol}//${window.location.host}/ws/transcribe`
             );
+            const effectiveMode = overrideMode ?? cfg.mode;
             let handlers = {
               onInterim: (_t: string) => {},
               onTranscript: (_t: string, _l?: string) => {},
@@ -840,10 +847,10 @@ export default function App() {
               ws.send(
                 JSON.stringify({
                   type: "start",
-                  mode: cfg.mode,
+                  mode: effectiveMode,
                   languageCodes: langHint ? [langHint] : [],
                   customVocabulary: cfg.customVocabulary,
-                  ...(cfg.mode === "SMART" && sourceContext
+                  ...(effectiveMode === "SMART" && sourceContext
                     ? { sourceText: sourceContext }
                     : {}),
                 })
@@ -943,11 +950,7 @@ export default function App() {
           }, 150);
         };
 
-        const chunkStates: Array<"pending" | "active" | "done"> = chunks.map(
-          () => "pending"
-        );
         const retryCounts: number[] = chunks.map(() => 0);
-        const langRetried: boolean[] = chunks.map(() => false);
         const rawChunkTexts: string[] = chunks.map(() => "");
         const rawChunkLangs: Array<string | undefined> = chunks.map(
           () => undefined
@@ -1080,43 +1083,31 @@ export default function App() {
           }
         };
 
-        const claimNextChunk = (): number | null => {
+        /**
+         * Strictly focuses on the current 15s segment (or at most 1 immediate next segment
+         * while playing current audio) instead of jumping ahead across distant segments.
+         */
+        const pickFocusedSegment = (): number | null => {
           if (isPreBufferingRef.current) {
-            for (let i = 0; i < chunks.length; i++) {
-              if (chunkStates[i] === "pending") {
-                chunkStates[i] = "active";
-                return i;
-              }
-            }
-            return null;
+            return completedSet.has(0) ? null : 0;
           }
-
           if (isAudioPlayingRef.current) {
             const currentSec = audioElRef.current?.currentTime ?? 0;
-            const playheadChunk = findChunkAtSec(currentSec);
-            if (chunkStates[playheadChunk] === "pending") {
-              chunkStates[playheadChunk] = "active";
-              return playheadChunk;
+            const playheadIdx = findChunkAtSec(currentSec);
+            if (!completedSet.has(playheadIdx)) {
+              return playheadIdx;
             }
-            for (let i = playheadChunk + 1; i < chunks.length; i++) {
-              if (chunkStates[i] === "pending") {
-                chunkStates[i] = "active";
-                return i;
-              }
-            }
-            for (let i = 0; i < playheadChunk; i++) {
-              if (chunkStates[i] === "pending") {
-                chunkStates[i] = "active";
-                return i;
-              }
+            if (
+              playheadIdx + 1 < chunks.length &&
+              !completedSet.has(playheadIdx + 1)
+            ) {
+              return playheadIdx + 1;
             }
             return null;
           }
-
           if (audioPlaybackEndedRef.current) {
             for (let i = 0; i < chunks.length; i++) {
-              if (chunkStates[i] === "pending") {
-                chunkStates[i] = "active";
+              if (!completedSet.has(i)) {
                 return i;
               }
             }
@@ -1134,16 +1125,21 @@ export default function App() {
           );
         };
 
-        // Step 2: Pre-warm ALL workers concurrently so all Live sessions are ready before transcribing
-        const preWarmedConns: Array<Awaited<ReturnType<typeof openLiveWs>> | null> =
-          await Promise.all(
-            Array.from({ length: workerCount }, async () => {
-              const conn = await openLiveWs(lockedAutoLang);
+        // Pre-warm all 3 workers concurrently so all Live sessions are ready before transcribing
+        let preWarmedConns: Array<Awaited<ReturnType<typeof openLiveWs>> | null> =
+          [];
+        if (workerCount > 0) {
+          preWarmedConns = await Promise.all(
+            Array.from({ length: workerCount }, async (_, idx) => {
+              const modeForPass =
+                idx === 2 ? "SMART" : cfg.mode;
+              const conn = await openLiveWs(lockedAutoLang, undefined, modeForPass);
               readyWorkerCount += 1;
               syncProgressUI();
               return conn;
             })
           );
+        }
 
         if (abortController.signal.aborted) {
           preWarmedConns.forEach((c) => closeLiveConn(c));
@@ -1154,121 +1150,97 @@ export default function App() {
         preRollStage = "transcribing";
         syncProgressUI();
 
-        const runWorker = async (workerId: number) => {
-          let pendingPreWarmedConn = preWarmedConns[workerId] ?? null;
-          preWarmedConns[workerId] = null;
+        interface WorkerPassSpec {
+          passId: number;
+          useRaw: boolean;
+          mode: "VERBATIM" | "SMART";
+          intervalMs: number;
+        }
+
+        const PASS_SPECS: WorkerPassSpec[] = [
+          { passId: 0, useRaw: true, mode: cfg.mode, intervalMs: 118 },
+          { passId: 1, useRaw: false, mode: "VERBATIM", intervalMs: 112 },
+          { passId: 2, useRaw: false, mode: "SMART", intervalMs: 115 },
+        ];
+
+        const runSinglePassOnSegment = async (
+          targetIdx: number,
+          spec: WorkerPassSpec,
+          preConn: Awaited<ReturnType<typeof openLiveWs>> | null,
+          forcedLangHint?: string | null
+        ) => {
+          const chunk = chunks[targetIdx];
+          const packets = spec.useRaw
+            ? chunk.rawPacketsBase64
+            : chunk.pcmPacketsBase64;
+          const startSeekSeq = uploadSeekSeqRef.current;
+
+          let conn: Awaited<ReturnType<typeof openLiveWs>> | null = null;
+          let interruptedByControl = false;
+          let packetsSent = 0;
+          let passError: string | null = null;
+          let turnCompleteReceived = false;
+          let closeCode: number | undefined;
+          const finalParts: string[] = [];
+          let latestInterim = "";
+          let detectedLang: string | undefined;
 
           try {
-            while (
-              !abortController.signal.aborted &&
-              !fatalError &&
-              completedSet.size < chunks.length
-            ) {
-              const shouldActivelyRun =
-                isPreBufferingRef.current ||
-                isAudioPlayingRef.current ||
-                audioPlaybackEndedRef.current;
+            const langToUse =
+              forcedLangHint !== undefined ? forcedLangHint : lockedAutoLang;
+            const prevSourceText =
+              spec.mode === "SMART" &&
+              targetIdx > 0 &&
+              rawChunkTexts[targetIdx - 1]
+                ? rawChunkTexts[targetIdx - 1].slice(-220)
+                : undefined;
 
-              if (!shouldActivelyRun) {
-                if (workerId === 0) {
-                  setInterimText("");
-                  syncProgressUI();
-                }
-                await new Promise((r) => setTimeout(r, 150));
-                continue;
-              }
-
-              const targetIdx = claimNextChunk();
-              if (targetIdx === null) {
-                if (chunkStates.every((st) => st === "done")) {
-                  break;
-                }
-                await new Promise((r) => setTimeout(r, 150));
-                continue;
-              }
-
-              const chunk = chunks[targetIdx];
-              activeChunksSet.add(targetIdx);
-              syncProgressUI();
-
-              if (!chunk.hasAudioSignal || chunk.pcmPacketsBase64.length === 0) {
-                activeChunksSet.delete(targetIdx);
-                chunkStates[targetIdx] = "done";
-                completedSet.add(targetIdx);
-                await maybeStartAutoPlayback();
-                syncProgressUI();
-                continue;
-              }
-
-              let conn: Awaited<ReturnType<typeof openLiveWs>> | null = null;
-              let interruptedByPause = false;
-              let packetsSent = 0;
-              let chunkError: string | null = null;
-              let turnCompleteReceived = false;
-              let closeCode: number | undefined;
-              const chunkFinalParts: string[] = [];
-              let latestInterim = "";
-              let detectedLang: string | undefined;
-
+            if (preConn && preConn.ws.readyState === WebSocket.OPEN) {
+              conn = preConn;
+            } else {
+              if (preConn) closeLiveConn(preConn);
               try {
+                conn = await openLiveWs(langToUse, prevSourceText, spec.mode);
+              } catch (openErr) {
                 if (
-                  pendingPreWarmedConn &&
-                  pendingPreWarmedConn.ws.readyState === WebSocket.OPEN
+                  langToUse &&
+                  cfg.languageCode === "auto" &&
+                  !isFatalConfigError(
+                    openErr instanceof Error
+                      ? openErr.message
+                      : String(openErr)
+                  )
                 ) {
-                  conn = pendingPreWarmedConn;
-                  pendingPreWarmedConn = null;
+                  lockedAutoLang = null;
+                  conn = await openLiveWs(null, prevSourceText, spec.mode);
                 } else {
-                  if (pendingPreWarmedConn) {
-                    closeLiveConn(pendingPreWarmedConn);
-                    pendingPreWarmedConn = null;
-                  }
-                  const initialHint = lockedAutoLang;
-                  const prevSourceText =
-                    cfg.mode === "SMART" &&
-                    targetIdx > 0 &&
-                    rawChunkTexts[targetIdx - 1]
-                      ? rawChunkTexts[targetIdx - 1].slice(-220)
-                      : undefined;
-                  try {
-                    conn = await openLiveWs(initialHint, prevSourceText);
-                  } catch (openErr) {
-                    // If lockedAutoLang wasn't accepted, safely fall back to auto-detect
-                    if (
-                      initialHint &&
-                      cfg.languageCode === "auto" &&
-                      !isFatalConfigError(
-                        openErr instanceof Error
-                          ? openErr.message
-                          : String(openErr)
-                      )
-                    ) {
-                      lockedAutoLang = null;
-                      conn = await openLiveWs(null, prevSourceText);
-                    } else {
-                      throw openErr;
-                    }
-                  }
+                  throw openErr;
                 }
+              }
+            }
 
-              let onActivitySignal: (() => void) | null = null;
-              let onFinishSignal: (() => void) | null = null;
+            let onActivitySignal: (() => void) | null = null;
+            let onFinishSignal: (() => void) | null = null;
 
-              conn.setChunkHandlers({
-                onInterim: (txt) => {
-                  latestInterim = txt;
-                  onActivitySignal?.();
+            conn.setChunkHandlers({
+              onInterim: (txt) => {
+                latestInterim = txt;
+                onActivitySignal?.();
+                if (spec.passId === 0 && isAudioPlayingRef.current) {
                   const nowChunk = findChunkAtSec(
                     audioElRef.current?.currentTime ?? 0
                   );
-                  if (nowChunk === targetIdx && isAudioPlayingRef.current) {
+                  if (nowChunk === targetIdx) {
                     setInterimText(txt);
                   }
-                },
-                onTranscript: (txt, lang) => {
-                  const cleaned = txt.trim();
-                  if (cleaned) {
-                    chunkFinalParts.push(cleaned);
-                    latestInterim = "";
+                }
+              },
+              onTranscript: (txt, lang) => {
+                const cleaned = txt.trim();
+                if (cleaned) {
+                  finalParts.push(cleaned);
+                  latestInterim = "";
+                  if (spec.passId === 0) {
                     const nowChunk = findChunkAtSec(
                       audioElRef.current?.currentTime ?? 0
                     );
@@ -1276,159 +1248,252 @@ export default function App() {
                       setInterimText("");
                     }
                   }
-                  if (lang) detectedLang = lang;
-                  onActivitySignal?.();
-                },
-                onTurnComplete: () => {
-                  turnCompleteReceived = true;
-                  onFinishSignal?.();
-                },
-                onClose: (code) => {
-                  closeCode = code;
-                  onFinishSignal?.();
-                },
-                onError: (errMsg) => {
-                  chunkError = errMsg;
-                  onFinishSignal?.();
-                },
-              });
-
-              // Stream 128ms mic-cadence PCM packets at 95ms (~1.35x natural speed) so zero words drop
-              for (let p = 0; p < chunk.pcmPacketsBase64.length; p++) {
-                if (abortController.signal.aborted || chunkError) break;
-                if (
-                  !isPreBufferingRef.current &&
-                  !isAudioPlayingRef.current &&
-                  !audioPlaybackEndedRef.current
-                ) {
-                  interruptedByPause = true;
-                  break;
                 }
-                if (conn.ws.readyState !== WebSocket.OPEN) {
-                  chunkError =
-                    chunkError || "Live connection closed mid-segment.";
-                  break;
-                }
+                if (lang) detectedLang = lang;
+                onActivitySignal?.();
+              },
+              onTurnComplete: () => {
+                turnCompleteReceived = true;
+                onFinishSignal?.();
+              },
+              onClose: (code) => {
+                closeCode = code;
+                onFinishSignal?.();
+              },
+              onError: (errMsg) => {
+                passError = errMsg;
+                onFinishSignal?.();
+              },
+            });
 
-                conn.ws.send(
-                  JSON.stringify({
-                    type: "audio",
-                    data: chunk.pcmPacketsBase64[p],
-                  })
-                );
-                packetsSent++;
-                await new Promise((r) => setTimeout(r, 95));
-              }
-
+            // Stream 128ms PCM frames at natural 112-118ms mic cadence (~1.1x)
+            for (let p = 0; p < packets.length; p++) {
+              if (abortController.signal.aborted || passError) break;
               if (
-                !abortController.signal.aborted &&
-                !chunkError &&
-                conn.ws.readyState === WebSocket.OPEN
+                !isPreBufferingRef.current &&
+                !isAudioPlayingRef.current &&
+                !audioPlaybackEndedRef.current
               ) {
-                conn.ws.send(JSON.stringify({ type: "audioStreamEnd" }));
-
-                await new Promise<void>((resolve) => {
-                  let settled = false;
-                  const idleDelay = interruptedByPause ? 550 : 1600;
-                  const maxDelay = interruptedByPause ? 850 : 6500;
-                  let idleTimer = window.setTimeout(() => done(), idleDelay);
-                  const maxTimer = window.setTimeout(() => done(), maxDelay);
-
-                  const done = () => {
-                    if (settled) return;
-                    settled = true;
-                    window.clearTimeout(idleTimer);
-                    window.clearTimeout(maxTimer);
-                    onActivitySignal = null;
-                    onFinishSignal = null;
-                    resolve();
-                  };
-
-                  onActivitySignal = () => {
-                    if (settled) return;
-                    window.clearTimeout(idleTimer);
-                    idleTimer = window.setTimeout(() => done(), idleDelay);
-                  };
-
-                  onFinishSignal = () => done();
-                });
+                interruptedByControl = true;
+                break;
               }
-            } catch (err) {
-              chunkError =
-                err instanceof Error ? err.message : "Worker connection error.";
-            } finally {
-              closeLiveConn(conn);
-              conn = null;
+              if (uploadSeekSeqRef.current !== startSeekSeq) {
+                const seekedChunk = findChunkAtSec(
+                  audioElRef.current?.currentTime ?? 0
+                );
+                if (!completedSet.has(seekedChunk) && seekedChunk !== targetIdx) {
+                  interruptedByControl = true;
+                  break;
+                }
+              }
+              if (conn.ws.readyState !== WebSocket.OPEN) {
+                passError =
+                  passError || "Live connection closed mid-segment.";
+                break;
+              }
+
+              conn.ws.send(
+                JSON.stringify({
+                  type: "audio",
+                  data: packets[p],
+                })
+              );
+              packetsSent++;
+              await new Promise((r) => setTimeout(r, spec.intervalMs));
             }
+
+            if (
+              !abortController.signal.aborted &&
+              !passError &&
+              conn.ws.readyState === WebSocket.OPEN
+            ) {
+              conn.ws.send(JSON.stringify({ type: "audioStreamEnd" }));
+
+              await new Promise<void>((resolve) => {
+                let settled = false;
+                const idleDelay = interruptedByControl ? 450 : 1500;
+                const maxDelay = interruptedByControl ? 750 : 6000;
+                let idleTimer = window.setTimeout(() => done(), idleDelay);
+                const maxTimer = window.setTimeout(() => done(), maxDelay);
+
+                const done = () => {
+                  if (settled) return;
+                  settled = true;
+                  window.clearTimeout(idleTimer);
+                  window.clearTimeout(maxTimer);
+                  onActivitySignal = null;
+                  onFinishSignal = null;
+                  resolve();
+                };
+
+                onActivitySignal = () => {
+                  if (settled) return;
+                  window.clearTimeout(idleTimer);
+                  idleTimer = window.setTimeout(() => done(), idleDelay);
+                };
+
+                onFinishSignal = () => done();
+              });
+            }
+          } catch (err) {
+            passError =
+              err instanceof Error ? err.message : "Worker connection error.";
+          } finally {
+            closeLiveConn(conn);
+            conn = null;
+          }
+
+          const rawText = cleanTranscriptArtifacts(
+            finalParts.length > 0 ? finalParts.join(" ") : latestInterim
+          );
+          const streamedMostlyComplete =
+            !interruptedByControl ||
+            packetsSent >= Math.floor(packets.length * 0.9);
+
+          return {
+            text: rawText,
+            lang: detectedLang,
+            isSmart: spec.mode === "SMART",
+            passError,
+            turnCompleteReceived,
+            closeCode,
+            streamedMostlyComplete,
+            packetsRatio: packetsSent / Math.max(1, packets.length),
+          };
+        };
+
+        try {
+          while (
+            !abortController.signal.aborted &&
+            !fatalError &&
+            completedSet.size < chunks.length
+          ) {
+            const shouldRun =
+              isPreBufferingRef.current ||
+              isAudioPlayingRef.current ||
+              audioPlaybackEndedRef.current;
+
+            if (!shouldRun) {
+              setInterimText("");
+              syncProgressUI();
+              await new Promise((r) => setTimeout(r, 150));
+              continue;
+            }
+
+            const targetIdx = pickFocusedSegment();
+            if (targetIdx === null) {
+              await new Promise((r) => setTimeout(r, 150));
+              continue;
+            }
+
+            const chunk = chunks[targetIdx];
+            activeChunksSet.clear();
+            activeChunksSet.add(targetIdx);
+            syncProgressUI();
+
+            if (!chunk.hasAudioSignal || chunk.pcmPacketsBase64.length === 0) {
+              activeChunksSet.delete(targetIdx);
+              completedSet.add(targetIdx);
+              await maybeStartAutoPlayback();
+              syncProgressUI();
+              continue;
+            }
+
+            // Use pre-warmed connections for Segment 0 on the very first run
+            const passPreConns = PASS_SPECS.map((_, idx) => {
+              const c = preWarmedConns[idx] ?? null;
+              preWarmedConns[idx] = null;
+              return c;
+            });
+
+            // Run all 3 focused workers TOGETHER on this exact 15s segment
+            const results = await Promise.all(
+              PASS_SPECS.map((spec, idx) =>
+                runSinglePassOnSegment(targetIdx, spec, passPreConns[idx])
+              )
+            );
 
             if (abortController.signal.aborted) {
               activeChunksSet.delete(targetIdx);
               break;
             }
 
-            const nowChunk = findChunkAtSec(
-              audioElRef.current?.currentTime ?? 0
-            );
-            if (nowChunk === targetIdx) {
-              setInterimText("");
-            }
+            setInterimText("");
 
-            if (chunkError && isFatalConfigError(chunkError)) {
-              fatalError = chunkError;
+            const fatal = results.find(
+              (r) => r.passError && isFatalConfigError(r.passError)
+            );
+            if (fatal?.passError) {
+              fatalError = fatal.passError;
               activeChunksSet.delete(targetIdx);
-              chunkStates[targetIdx] = "pending";
               syncProgressUI();
               break;
             }
 
-            const combinedText = cleanTranscriptArtifacts(
-              chunkFinalParts.length > 0
-                ? chunkFinalParts.join(" ")
-                : latestInterim
+            const allCompletedRatio = results.reduce(
+              (maxR, r) => Math.max(maxR, r.packetsRatio),
+              0
+            );
+            const anyMostlyComplete = results.some(
+              (r) => r.streamedMostlyComplete
             );
 
-            const streamedMostlyComplete =
-              !interruptedByPause ||
-              packetsSent >= Math.floor(chunk.pcmPacketsBase64.length * 0.9);
+            // Reconcile across all 3 workers on this 15s segment
+            let reconciled = reconcileFocusedTranscripts(
+              results.map((r) => ({
+                text: r.text,
+                lang: r.lang,
+                isSmart: r.isSmart,
+              })),
+              lockedScriptFamily
+            );
 
-            // Detect script/language anchor from earliest segments and guard against sudden foreign hallucinations
-            const segScript = combinedText
-              ? detectScriptFamily(combinedText)
+            // Lock dominant script/language from earliest segment
+            const domScript = reconciled.text
+              ? detectScriptFamily(reconciled.text)
               : null;
-
             if (
               cfg.languageCode === "auto" &&
-              combinedText &&
+              reconciled.text &&
               !lockedScriptFamily &&
               (targetIdx <= 1 || completedSet.size === 0)
             ) {
-              lockedScriptFamily = segScript;
+              lockedScriptFamily = domScript;
               lockedAutoLang =
-                detectedLang ?? scriptFamilyToBcp47(segScript) ?? null;
+                reconciled.lang ?? scriptFamilyToBcp47(domScript) ?? null;
             }
 
-            const isWildScriptMismatch =
+            // If Segment 0 mixed Latin + non-Latin (e.g. English intro inside Amharic), run 1 focused locked-lang verification pass before playback opens!
+            if (
+              targetIdx === 0 &&
               cfg.languageCode === "auto" &&
-              Boolean(lockedScriptFamily) &&
-              Boolean(segScript) &&
-              segScript !== lockedScriptFamily &&
-              !langRetried[targetIdx];
-
-            if (isWildScriptMismatch && lockedAutoLang) {
-              langRetried[targetIdx] = true;
-              activeChunksSet.delete(targetIdx);
-              chunkStates[targetIdx] = "pending";
-              syncProgressUI();
-              await new Promise((r) => setTimeout(r, 300));
-              continue;
+              lockedAutoLang &&
+              reconciled.text &&
+              hasMixedLatinWithNonLatin(reconciled.text)
+            ) {
+              const verified = await runSinglePassOnSegment(
+                0,
+                { passId: 0, useRaw: false, mode: cfg.mode, intervalMs: 115 },
+                null,
+                lockedAutoLang
+              );
+              if (
+                verified.text &&
+                detectScriptFamily(verified.text) === lockedScriptFamily &&
+                !hasMixedLatinWithNonLatin(verified.text)
+              ) {
+                reconciled = {
+                  text: verified.text,
+                  lang: verified.lang ?? lockedAutoLang,
+                };
+              }
             }
 
-            if (combinedText && !abortController.signal.aborted) {
-              rawChunkTexts[targetIdx] = combinedText;
-              rawChunkLangs[targetIdx] = detectedLang;
-              rawChunkComplete[targetIdx] = streamedMostlyComplete;
-              rawChunkRatio[targetIdx] =
-                packetsSent / Math.max(1, chunk.pcmPacketsBase64.length);
+            if (reconciled.text && !abortController.signal.aborted) {
+              rawChunkTexts[targetIdx] = reconciled.text;
+              rawChunkLangs[targetIdx] = reconciled.lang;
+              rawChunkComplete[targetIdx] = anyMostlyComplete;
+              rawChunkRatio[targetIdx] = allCompletedRatio;
 
               commitStitchedChunk(targetIdx);
               if (
@@ -1440,47 +1505,38 @@ export default function App() {
             }
 
             const abnormalDropWithoutText =
-              !combinedText &&
-              (Boolean(chunkError) ||
-                (!turnCompleteReceived &&
-                  closeCode !== undefined &&
-                  closeCode !== 1000 &&
-                  closeCode !== 1005) ||
-                !turnCompleteReceived);
+              !reconciled.text &&
+              results.some(
+                (r) =>
+                  Boolean(r.passError) ||
+                  (!r.turnCompleteReceived &&
+                    r.closeCode !== undefined &&
+                    r.closeCode !== 1000 &&
+                    r.closeCode !== 1005)
+              );
 
             activeChunksSet.delete(targetIdx);
 
-            if (!streamedMostlyComplete) {
-              chunkStates[targetIdx] = "pending";
-            } else if (abnormalDropWithoutText && retryCounts[targetIdx] < 2) {
-              retryCounts[targetIdx] += 1;
-              chunkStates[targetIdx] = "pending";
+            if (!anyMostlyComplete) {
+              // Interrupted by pause/seek — retry this segment cleanly on resume
               syncProgressUI();
-              await new Promise((r) =>
-                setTimeout(r, 400 * retryCounts[targetIdx])
-              );
               continue;
-            } else {
-              chunkStates[targetIdx] = "done";
-              completedSet.add(targetIdx);
-              await maybeStartAutoPlayback();
             }
 
+            if (abnormalDropWithoutText && retryCounts[targetIdx] < 1) {
+              retryCounts[targetIdx] += 1;
+              syncProgressUI();
+              await new Promise((r) => setTimeout(r, 400));
+              continue;
+            }
+
+            completedSet.add(targetIdx);
+            await maybeStartAutoPlayback();
             syncProgressUI();
-            }
-          } finally {
-            if (pendingPreWarmedConn) {
-              closeLiveConn(pendingPreWarmedConn);
-              pendingPreWarmedConn = null;
-            }
           }
-        };
-
-        await Promise.all(
-          Array.from({ length: workerCount }, (_, workerId) =>
-            runWorker(workerId)
-          )
-        );
+        } finally {
+          preWarmedConns.forEach((c) => closeLiveConn(c));
+        }
 
         setInterimText("");
 

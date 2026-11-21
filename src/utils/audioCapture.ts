@@ -63,15 +63,15 @@ export function downsampleBuffer(
 }
 
 /**
- * First-order ~75Hz high-pass + DC-blocking filter to remove low-frequency rumble
- * and microphone DC bias while keeping vocal fundamentals intact.
+ * First-order ~55Hz high-pass + DC-blocking filter to remove low-frequency rumble
+ * and microphone DC bias while preserving full vocal warmth.
  */
 export function applySpeechHighPassFilter(
   samples: Float32Array,
   sampleRate: number
 ): Float32Array {
   if (samples.length === 0) return samples;
-  const cutoffHz = 75;
+  const cutoffHz = 55;
   const rc = 1 / (2 * Math.PI * cutoffHz);
   const dt = 1 / Math.max(1, sampleRate);
   const alpha = rc / (rc + dt);
@@ -149,6 +149,7 @@ export interface AudioPcmChunk {
   speechStartSec: number;
   speechEndSec: number;
   pcmPacketsBase64: string[];
+  rawPacketsBase64: string[];
   hasAudioSignal: boolean;
 }
 
@@ -180,15 +181,15 @@ export async function sliceAudioFileIntoLiveChunks(
       }
     }
 
-    // Apply ~75Hz high-pass / DC-blocking filter cleanly across whole track
+    // Apply ~55Hz high-pass / DC-blocking filter cleanly across whole track
     const mono = applySpeechHighPassFilter(rawMono, srcRate);
 
     const samplesPerChunk = Math.floor(chunkDurationSec * srcRate);
     const snapRadiusSamples = Math.floor(0.45 * srcRate);
     const frameWindowSamples = Math.max(1, Math.floor(0.025 * srcRate));
     const minChunkSamples = Math.floor(2 * srcRate);
-    const leadInSamples = Math.floor(0.6 * srcRate);
-    const silentFlushPacket = float32ToBase64Pcm16(
+    const leadInSamples = Math.floor(0.55 * srcRate);
+    const silentPadPacket = float32ToBase64Pcm16(
       new Float32Array(samplesPerPacket)
     );
 
@@ -227,6 +228,24 @@ export async function sliceAudioFileIntoLiveChunks(
     let index = 0;
     let startSample = 0;
 
+    const packetize = (samples: Float32Array, hasSignal: boolean): string[] => {
+      const ds = downsampleBuffer(samples, srcRate, 16000);
+      const pkts: string[] = [];
+      // 256ms silent VAD warm-up lead-in so opening words at 0.00s never clip
+      if (hasSignal && ds.length > 0) {
+        pkts.push(silentPadPacket, silentPadPacket);
+      }
+      for (let p = 0; p < ds.length; p += samplesPerPacket) {
+        const endIdx = Math.min(ds.length, p + samplesPerPacket);
+        pkts.push(float32ToBase64Pcm16(ds.subarray(p, endIdx)));
+      }
+      // 256ms trailing digital silence flush so final words commit cleanly
+      if (hasSignal && pkts.length > 2) {
+        pkts.push(silentPadPacket, silentPadPacket);
+      }
+      return pkts;
+    };
+
     while (startSample < mono.length) {
       const nominalEnd = (index + 1) * samplesPerChunk;
       const endSample =
@@ -247,6 +266,7 @@ export async function sliceAudioFileIntoLiveChunks(
       const canonRms = Math.sqrt(
         canonSumSq / Math.max(1, canonicalSlice.length)
       );
+      const hasAudioSignal = canonRms > 0.0001;
 
       const startSec = Number((startSample / srcRate).toFixed(2));
       const endSec = Number((endSample / srcRate).toFixed(2));
@@ -288,25 +308,17 @@ export async function sliceAudioFileIntoLiveChunks(
             )
           : endSec;
 
-      // Add 0.60s acoustic lead-in overlap for chunks > 0 so boundary syllables never clip
+      // Add 0.55s acoustic lead-in overlap for chunks > 0 so boundary syllables never clip
       const streamStartSample =
         index > 0 ? Math.max(0, startSample - leadInSamples) : startSample;
       const streamSlice = mono.subarray(streamStartSample, endSample);
-      const conditioned = normalizeSpeechDynamics(streamSlice);
-      const downsampled = downsampleBuffer(conditioned, srcRate, 16000);
+      const rawSlice = rawMono.subarray(streamStartSample, endSample);
 
-      const pcmPacketsBase64: string[] = [];
-      for (let p = 0; p < downsampled.length; p += samplesPerPacket) {
-        const endIdx = Math.min(downsampled.length, p + samplesPerPacket);
-        pcmPacketsBase64.push(
-          float32ToBase64Pcm16(downsampled.subarray(p, endIdx))
-        );
-      }
-
-      // Append 256ms of digital silence flush so the model emits the final word cleanly
-      if (canonRms > 0.0001 && pcmPacketsBase64.length > 0) {
-        pcmPacketsBase64.push(silentFlushPacket, silentFlushPacket);
-      }
+      const pcmPacketsBase64 = packetize(
+        normalizeSpeechDynamics(streamSlice),
+        hasAudioSignal
+      );
+      const rawPacketsBase64 = packetize(rawSlice, hasAudioSignal);
 
       chunks.push({
         index,
@@ -317,7 +329,8 @@ export async function sliceAudioFileIntoLiveChunks(
         speechEndSec:
           speechEndSec - speechStartSec >= 0.8 ? speechEndSec : endSec,
         pcmPacketsBase64,
-        hasAudioSignal: canonRms > 0.0001,
+        rawPacketsBase64,
+        hasAudioSignal,
       });
 
       startSample = endSample;
@@ -403,15 +416,116 @@ export function stitchChunkBoundary(
 }
 
 export function detectScriptFamily(text: string): string | null {
-  if (/[\u1200-\u137F]/.test(text)) return "ethiopic";
-  if (/[\u0900-\u097F]/.test(text)) return "devanagari";
-  if (/[\u0600-\u06FF]/.test(text)) return "arabic";
-  if (/[\u3040-\u30FF]/.test(text)) return "japanese";
-  if (/[\uAC00-\uD7AF]/.test(text)) return "korean";
-  if (/[\u4E00-\u9FFF]/.test(text)) return "cjk";
-  if (/[\u0400-\u04FF]/.test(text)) return "cyrillic";
-  if (/[A-Za-z]/.test(text)) return "latin";
-  return null;
+  const counts: Record<string, number> = {
+    ethiopic: (text.match(/[\u1200-\u137F]/g) ?? []).length,
+    devanagari: (text.match(/[\u0900-\u097F]/g) ?? []).length,
+    arabic: (text.match(/[\u0600-\u06FF]/g) ?? []).length,
+    japanese: (text.match(/[\u3040-\u30FF]/g) ?? []).length,
+    korean: (text.match(/[\uAC00-\uD7AF]/g) ?? []).length,
+    cjk: (text.match(/[\u4E00-\u9FFF]/g) ?? []).length,
+    cyrillic: (text.match(/[\u0400-\u04FF]/g) ?? []).length,
+    latin: (text.match(/[A-Za-z]/g) ?? []).length,
+  };
+  let bestFamily: string | null = null;
+  let bestCount = 0;
+  for (const [family, count] of Object.entries(counts)) {
+    if (count > bestCount) {
+      bestCount = count;
+      bestFamily = family;
+    }
+  }
+  return bestFamily;
+}
+
+export function hasMixedLatinWithNonLatin(text: string): boolean {
+  const dominant = detectScriptFamily(text);
+  if (!dominant || dominant === "latin") return false;
+  const latinChars = (text.match(/[A-Za-z]/g) ?? []).length;
+  return latinChars >= 4;
+}
+
+function buildFeatureSet(text: string): Set<string> {
+  const features = new Set<string>();
+  const words = text
+    .split(/\s+/)
+    .map(normalizeToken)
+    .filter(Boolean);
+  for (const w of words) features.add(`w:${w}`);
+  const compact = text.replace(/\s+/g, "").toLowerCase();
+  for (let i = 0; i + 3 <= compact.length; i++) {
+    features.add(`g:${compact.slice(i, i + 3)}`);
+  }
+  return features;
+}
+
+/**
+ * Reconciles 1-4 independent worker transcripts produced on the SAME 15s segment
+ * to reject truncated partial passes or isolated hallucinations and pick the fullest,
+ * highest-consensus transcript.
+ */
+export function reconcileFocusedTranscripts(
+  passes: Array<{ text: string; lang?: string; isSmart?: boolean }>,
+  preferredScript?: string | null
+): { text: string; lang?: string } {
+  const valid = passes
+    .map((p) => ({ ...p, text: cleanTranscriptArtifacts(p.text) }))
+    .filter((p) => p.text.length > 0);
+
+  if (valid.length === 0) return { text: "" };
+  if (valid.length === 1) return { text: valid[0].text, lang: valid[0].lang };
+
+  const scriptPool = preferredScript
+    ? valid.filter((p) => detectScriptFamily(p.text) === preferredScript)
+    : [];
+  const pool = scriptPool.length > 0 ? scriptPool : valid;
+  if (pool.length === 1) return { text: pool[0].text, lang: pool[0].lang };
+
+  const featureSets = pool.map((p) => buildFeatureSet(p.text));
+  const supportScores = pool.map((_, idx) => {
+    const mine = featureSets[idx];
+    if (mine.size === 0) return 0;
+    let supported = 0;
+    for (const feat of mine) {
+      for (let j = 0; j < pool.length; j++) {
+        if (j !== idx && featureSets[j].has(feat)) {
+          supported++;
+          break;
+        }
+      }
+    }
+    return supported / mine.size;
+  });
+
+  const nonOutlierIndices = pool
+    .map((_, i) => i)
+    .filter((i) => supportScores[i] >= 0.25);
+  const maxLen = Math.max(
+    1,
+    ...(nonOutlierIndices.length > 0
+      ? nonOutlierIndices.map((i) => pool[i].text.length)
+      : pool.map((p) => p.text.length))
+  );
+
+  let bestIdx = 0;
+  let bestScore = -1;
+
+  for (let i = 0; i < pool.length; i++) {
+    const coverage = Math.min(1, pool[i].text.length / maxLen);
+    const mixedPenalty = hasMixedLatinWithNonLatin(pool[i].text) ? 0.12 : 0;
+    const smartBonus = pool[i].isSmart ? 0.02 : 0;
+    const score =
+      supportScores[i] * 0.52 + coverage * 0.48 + smartBonus - mixedPenalty;
+    if (score > bestScore) {
+      bestScore = score;
+      bestIdx = i;
+    }
+  }
+
+  const chosen = pool[bestIdx];
+  return {
+    text: chosen.text,
+    lang: chosen.lang ?? pool.find((p) => p.lang)?.lang,
+  };
 }
 
 export function scriptFamilyToBcp47(family: string | null): string | null {
