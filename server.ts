@@ -249,25 +249,35 @@ async function startServer(): Promise<void> {
 
         try {
           const isSmart = msg.mode === "SMART";
+          const cleanVocab = Array.isArray(msg.customVocabulary)
+            ? Array.from(
+                new Set(
+                  msg.customVocabulary
+                    .map((v) => String(v).trim())
+                    .filter(Boolean)
+                )
+              ).slice(0, 500)
+            : [];
+
           const inputAudioTranscription: AudioTranscriptionConfig = {
             languageCodes:
               Array.isArray(msg.languageCodes) && msg.languageCodes.length > 0
-                ? msg.languageCodes
+                ? msg.languageCodes.filter(Boolean).slice(0, 5)
                 : [],
             mode: isSmart
               ? AudioTranscriptionConfigMode.SMART
               : AudioTranscriptionConfigMode.VERBATIM,
           };
 
-          if (
-            Array.isArray(msg.customVocabulary) &&
-            msg.customVocabulary.length > 0
-          ) {
-            inputAudioTranscription.customVocabulary = msg.customVocabulary;
+          if (cleanVocab.length > 0) {
+            inputAudioTranscription.customVocabulary = cleanVocab;
           }
 
-          if (isSmart && msg.sourceText) {
-            inputAudioTranscription.sourceText = msg.sourceText;
+          if (isSmart && typeof msg.sourceText === "string") {
+            const trimmedSource = msg.sourceText.trim().slice(-400);
+            if (trimmedSource) {
+              inputAudioTranscription.sourceText = trimmedSource;
+            }
           }
 
           let readySent = false;

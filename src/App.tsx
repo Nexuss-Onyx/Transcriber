@@ -32,6 +32,7 @@ import {
 import {
   AUDIO_WORKLET_SOURCE,
   buildExportContent,
+  cleanTranscriptArtifacts,
   countWords,
   detectScriptFamily,
   downsampleBuffer,
@@ -40,6 +41,7 @@ import {
   scriptFamilyToBcp47,
   sliceAudioFileIntoLiveChunks,
   splitTextIntoTimedCues,
+  stitchChunkBoundary,
 } from "./utils/audioCapture";
 
 const STORAGE_KEY = "transcribe_live_sessions_v1";
@@ -416,22 +418,223 @@ export default function App() {
       silentGain.connect(audioCtx.destination);
 
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const ws = new WebSocket(
-        `${protocol}//${window.location.host}/ws/transcribe`
-      );
-      wsRef.current = ws;
+      const wsEndpoint = `${protocol}//${window.location.host}/ws/transcribe`;
+      let rotatingSocket = false;
 
       const sendPcmChunk = (float32: Float32Array) => {
         if (isPausedRef.current) return;
-        if (ws.readyState !== WebSocket.OPEN) return;
+        const activeWs = wsRef.current;
+        if (!activeWs || activeWs.readyState !== WebSocket.OPEN) return;
         const downsampled = downsampleBuffer(
           float32,
           audioCtx.sampleRate,
           16000
         );
         const base64 = float32ToBase64Pcm16(downsampled);
-        ws.send(JSON.stringify({ type: "audio", data: base64 }));
+        activeWs.send(JSON.stringify({ type: "audio", data: base64 }));
       };
+
+      const attachMicSocket = (isReplacement: boolean) => {
+        const ws = new WebSocket(wsEndpoint);
+        if (!isReplacement) {
+          wsRef.current = ws;
+        }
+
+        ws.onopen = () => {
+          const cfg = currentSess.config;
+          ws.send(
+            JSON.stringify({
+              type: "start",
+              mode: cfg.mode,
+              languageCodes:
+                cfg.languageCode === "auto" ? [] : [cfg.languageCode],
+              customVocabulary: cfg.customVocabulary,
+            })
+          );
+        };
+
+        ws.onmessage = (event) => {
+          let msg: {
+            type: string;
+            text?: string;
+            finished?: boolean;
+            languageCode?: string;
+            speakerLabel?: string;
+            startOffset?: string;
+            words?: WordTiming[];
+            message?: string;
+          };
+          try {
+            msg = JSON.parse(String(event.data));
+          } catch {
+            return;
+          }
+
+          if (msg.type === "ready") {
+            if (isReplacement) {
+              const previousWs = wsRef.current;
+              wsRef.current = ws;
+              rotatingSocket = false;
+              if (previousWs && previousWs !== ws) {
+                try {
+                  if (previousWs.readyState === WebSocket.OPEN) {
+                    previousWs.send(JSON.stringify({ type: "stop" }));
+                  }
+                } catch {
+                  // ignore
+                }
+                setTimeout(() => {
+                  try {
+                    previousWs.close();
+                  } catch {
+                    // ignore
+                  }
+                }, 250);
+              }
+              return;
+            }
+
+            setConnectionState("listening");
+            runStartRef.current = Date.now();
+            if (liveTimerRef.current === null) {
+              liveTimerRef.current = window.setInterval(() => {
+                if (!isPausedRef.current && runStartRef.current > 0) {
+                  const elapsed =
+                    accumulatedMsRef.current +
+                    (Date.now() - runStartRef.current);
+                  setLiveDurationMs(elapsed);
+                }
+              }, 250);
+            }
+            return;
+          }
+
+          if (msg.type === "goAway" && !rotatingSocket && wsRef.current === ws) {
+            rotatingSocket = true;
+            attachMicSocket(true);
+            return;
+          }
+
+          if (msg.type === "interim") {
+            setInterimText(msg.text ?? "");
+            if (msg.speakerLabel) setInterimSpeaker(msg.speakerLabel);
+            if (msg.languageCode) setInterimLanguage(msg.languageCode);
+            return;
+          }
+
+          if (msg.type === "transcript") {
+            const cleanText = cleanTranscriptArtifacts(msg.text ?? "");
+            setInterimText("");
+            if (!cleanText) return;
+
+            const currentElapsed =
+              accumulatedMsRef.current +
+              (!isPausedRef.current && runStartRef.current > 0
+                ? Date.now() - runStartRef.current
+                : 0);
+
+            const speakerId = msg.speakerLabel || "spk_1";
+            const lang = msg.languageCode;
+            const now = Date.now();
+
+            updateSessionById(targetSessionId, (s) => {
+              const lastSeg = s.segments[s.segments.length - 1];
+              const shouldMerge =
+                lastSeg &&
+                !lastSeg.isEdited &&
+                lastSeg.speakerId === speakerId &&
+                now - lastSegmentTimeRef.current < 2400 &&
+                !/[.!?።፧。？！]$/.test(lastSeg.text.trim()) &&
+                !msg.words?.length;
+
+              const updatedLanguages =
+                lang && !s.detectedLanguages.includes(lang)
+                  ? [...s.detectedLanguages, lang]
+                  : s.detectedLanguages;
+
+              if (shouldMerge) {
+                const mergedText = cleanTranscriptArtifacts(
+                  `${lastSeg.text} ${cleanText}`
+                );
+                const nextSegments = s.segments.slice(0, -1).concat({
+                  ...lastSeg,
+                  text: mergedText,
+                  languageCode: lang ?? lastSeg.languageCode,
+                });
+                return {
+                  ...s,
+                  segments: nextSegments,
+                  detectedLanguages: updatedLanguages,
+                  durationMs: Math.max(s.durationMs, currentElapsed),
+                  updatedAt: now,
+                };
+              }
+
+              const newSeg: TranscriptSegment = {
+                id: `seg_${now}_${Math.random().toString(36).slice(2, 6)}`,
+                text: cleanText,
+                speakerId,
+                languageCode: lang,
+                timestampMs: currentElapsed,
+                startOffset: msg.startOffset,
+                words: msg.words,
+              };
+
+              return {
+                ...s,
+                segments: [...s.segments, newSeg],
+                detectedLanguages: updatedLanguages,
+                durationMs: Math.max(s.durationMs, currentElapsed),
+                updatedAt: now,
+              };
+            });
+
+            lastSegmentTimeRef.current = now;
+            return;
+          }
+
+          if (msg.type === "error") {
+            if (isReplacement && wsRef.current !== ws) {
+              rotatingSocket = false;
+              return;
+            }
+            setErrorMessage(msg.message || "Transcription connection error.");
+            cleanupAudioPipeline();
+            setConnectionState("error");
+            if (wsRef.current) {
+              try {
+                wsRef.current.close();
+              } catch {
+                // ignore
+              }
+              wsRef.current = null;
+            }
+            return;
+          }
+
+          if (msg.type === "closed") {
+            if (wsRef.current === ws) {
+              cleanupAudioPipeline();
+              wsRef.current = null;
+              setConnectionState("idle");
+            }
+          }
+        };
+
+        ws.onerror = () => {
+          if (isReplacement && wsRef.current !== ws) {
+            rotatingSocket = false;
+            return;
+          }
+          setErrorMessage(
+            "WebSocket connection failed. Please ensure the server is running."
+          );
+          cleanupAudioPipeline();
+          setConnectionState("error");
+        };
+      };
+
+      attachMicSocket(false);
 
       let workletAttached = false;
       if (audioCtx.audioWorklet) {
@@ -468,160 +671,6 @@ export default function App() {
         scriptNode.connect(silentGain);
         scriptNodeRef.current = scriptNode;
       }
-
-      ws.onopen = () => {
-        const cfg = currentSess.config;
-        ws.send(
-          JSON.stringify({
-            type: "start",
-            mode: cfg.mode,
-            languageCodes: cfg.languageCode === "auto" ? [] : [cfg.languageCode],
-            customVocabulary: cfg.customVocabulary,
-            diarization: cfg.mode === "VERBATIM" ? cfg.diarization : false,
-            wordTimestamp: cfg.mode === "VERBATIM" ? cfg.wordTimestamp : false,
-          })
-        );
-      };
-
-      ws.onmessage = (event) => {
-        let msg: {
-          type: string;
-          text?: string;
-          finished?: boolean;
-          languageCode?: string;
-          speakerLabel?: string;
-          startOffset?: string;
-          words?: WordTiming[];
-          message?: string;
-        };
-        try {
-          msg = JSON.parse(String(event.data));
-        } catch {
-          return;
-        }
-
-        if (msg.type === "ready") {
-          setConnectionState("listening");
-          runStartRef.current = Date.now();
-          if (liveTimerRef.current === null) {
-            liveTimerRef.current = window.setInterval(() => {
-              if (!isPausedRef.current && runStartRef.current > 0) {
-                const elapsed =
-                  accumulatedMsRef.current + (Date.now() - runStartRef.current);
-                setLiveDurationMs(elapsed);
-              }
-            }, 250);
-          }
-          return;
-        }
-
-        if (msg.type === "interim") {
-          setInterimText(msg.text ?? "");
-          if (msg.speakerLabel) setInterimSpeaker(msg.speakerLabel);
-          if (msg.languageCode) setInterimLanguage(msg.languageCode);
-          return;
-        }
-
-        if (msg.type === "transcript") {
-          const cleanText = (msg.text ?? "").trim();
-          setInterimText("");
-          if (!cleanText) return;
-
-          const currentElapsed =
-            accumulatedMsRef.current +
-            (!isPausedRef.current && runStartRef.current > 0
-              ? Date.now() - runStartRef.current
-              : 0);
-
-          const speakerId = msg.speakerLabel || "spk_1";
-          const lang = msg.languageCode;
-          const now = Date.now();
-
-          updateSessionById(targetSessionId, (s) => {
-            const lastSeg = s.segments[s.segments.length - 1];
-            const shouldMerge =
-              lastSeg &&
-              !lastSeg.isEdited &&
-              lastSeg.speakerId === speakerId &&
-              now - lastSegmentTimeRef.current < 2200 &&
-              !/[.!?]$/.test(lastSeg.text.trim()) &&
-              !msg.words?.length;
-
-            const updatedLanguages =
-              lang && !s.detectedLanguages.includes(lang)
-                ? [...s.detectedLanguages, lang]
-                : s.detectedLanguages;
-
-            if (shouldMerge) {
-              const mergedText = `${lastSeg.text} ${cleanText}`;
-              const nextSegments = s.segments.slice(0, -1).concat({
-                ...lastSeg,
-                text: mergedText,
-                languageCode: lang ?? lastSeg.languageCode,
-              });
-              return {
-                ...s,
-                segments: nextSegments,
-                detectedLanguages: updatedLanguages,
-                durationMs: Math.max(s.durationMs, currentElapsed),
-                updatedAt: now,
-              };
-            }
-
-            const newSeg: TranscriptSegment = {
-              id: `seg_${now}_${Math.random().toString(36).slice(2, 6)}`,
-              text: cleanText,
-              speakerId,
-              languageCode: lang,
-              timestampMs: currentElapsed,
-              startOffset: msg.startOffset,
-              words: msg.words,
-            };
-
-            return {
-              ...s,
-              segments: [...s.segments, newSeg],
-              detectedLanguages: updatedLanguages,
-              durationMs: Math.max(s.durationMs, currentElapsed),
-              updatedAt: now,
-            };
-          });
-
-          lastSegmentTimeRef.current = now;
-          return;
-        }
-
-        if (msg.type === "error") {
-          setErrorMessage(msg.message || "Transcription connection error.");
-          cleanupAudioPipeline();
-          setConnectionState("error");
-          if (wsRef.current) {
-            try {
-              wsRef.current.close();
-            } catch {
-              // ignore
-            }
-            wsRef.current = null;
-          }
-          return;
-        }
-
-        if (msg.type === "closed") {
-          if (wsRef.current) {
-            cleanupAudioPipeline();
-            wsRef.current = null;
-            setConnectionState("idle");
-          }
-        }
-      };
-
-      ws.onerror = () => {
-        setErrorMessage(
-          "WebSocket connection failed. Please ensure the server is running."
-        );
-        cleanupAudioPipeline();
-        setConnectionState("error");
-      };
     } catch (err) {
       const msg =
         err instanceof Error
@@ -743,7 +792,7 @@ export default function App() {
         let lockedScriptFamily: string | null = null;
 
         // Isolated Live WebSocket session helper (1 independent session per 15s segment)
-        const openLiveWs = (langHint: string | null) =>
+        const openLiveWs = (langHint: string | null, sourceContext?: string) =>
           new Promise<{
             ws: WebSocket;
             setChunkHandlers: (handlers: {
@@ -786,6 +835,9 @@ export default function App() {
                   mode: cfg.mode,
                   languageCodes: langHint ? [langHint] : [],
                   customVocabulary: cfg.customVocabulary,
+                  ...(cfg.mode === "SMART" && sourceContext
+                    ? { sourceText: sourceContext }
+                    : {}),
                 })
               );
             };
@@ -888,9 +940,77 @@ export default function App() {
         );
         const retryCounts: number[] = chunks.map(() => 0);
         const langRetried: boolean[] = chunks.map(() => false);
+        const rawChunkTexts: string[] = chunks.map(() => "");
+        const rawChunkLangs: Array<string | undefined> = chunks.map(
+          () => undefined
+        );
+        const rawChunkComplete: boolean[] = chunks.map(() => false);
+        const rawChunkRatio: number[] = chunks.map(() => 1);
         const activeChunksSet = new Set<number>();
         const completedSet = new Set<number>();
         let fatalError: string | null = null;
+
+        const findChunkAtSec = (sec: number) => {
+          const found = chunks.findIndex(
+            (c) => sec >= c.startSec && sec < c.endSec
+          );
+          if (found >= 0) return found;
+          return Math.min(
+            chunks.length - 1,
+            Math.max(0, Math.floor(sec / 15))
+          );
+        };
+
+        const commitStitchedChunk = (idx: number) => {
+          const raw = rawChunkTexts[idx];
+          if (!raw || abortController.signal.aborted) return;
+          const chunkObj = chunks[idx];
+          const prevRaw = idx > 0 ? rawChunkTexts[idx - 1] : "";
+          const stitched = cleanTranscriptArtifacts(
+            prevRaw ? stitchChunkBoundary(prevRaw, raw) : raw
+          );
+          if (!stitched) return;
+
+          const startMs = Math.round(
+            (rawChunkComplete[idx]
+              ? chunkObj.speechStartSec
+              : chunkObj.startSec) * 1000
+          );
+          const actualEndSec = rawChunkComplete[idx]
+            ? chunkObj.speechEndSec
+            : Math.min(
+                chunkObj.endSec,
+                chunkObj.startSec +
+                  (chunkObj.endSec - chunkObj.startSec) * rawChunkRatio[idx]
+              );
+          const endMs = Math.max(startMs + 600, Math.round(actualEndSec * 1000));
+          const cues = splitTextIntoTimedCues(stitched, startMs, endMs);
+          const langCode = rawChunkLangs[idx] ?? lockedAutoLang ?? undefined;
+
+          const newSegments: TranscriptSegment[] = cues.map((cue, cueIdx) => ({
+            id: `seg_chunk_${idx}_${cueIdx}_${Date.now()}`,
+            text: cue.text,
+            speakerId: "spk_1",
+            languageCode: langCode,
+            timestampMs: cue.startMs,
+            endTimestampMs: cue.endMs,
+            chunkIndex: idx,
+          }));
+
+          updateSessionById(newSession.id, (s) => ({
+            ...s,
+            segments: [
+              ...s.segments.filter((seg) => seg.chunkIndex !== idx),
+              ...newSegments,
+            ].sort((a, b) => a.timestampMs - b.timestampMs),
+            detectedLanguages:
+              rawChunkLangs[idx] &&
+              !s.detectedLanguages.includes(rawChunkLangs[idx]!)
+                ? [...s.detectedLanguages, rawChunkLangs[idx]!]
+                : s.detectedLanguages,
+            updatedAt: Date.now(),
+          }));
+        };
 
         const syncProgressUI = () => {
           if (abortController.signal.aborted) return;
@@ -962,10 +1082,7 @@ export default function App() {
 
           if (isAudioPlayingRef.current) {
             const currentSec = audioElRef.current?.currentTime ?? 0;
-            const playheadChunk = Math.min(
-              chunks.length - 1,
-              Math.max(0, Math.floor(currentSec / 15))
-            );
+            const playheadChunk = findChunkAtSec(currentSec);
             if (chunkStates[playheadChunk] === "pending") {
               chunkStates[playheadChunk] = "active";
               return playheadChunk;
@@ -1064,8 +1181,12 @@ export default function App() {
 
             try {
               const initialHint = lockedAutoLang;
+              const prevSourceText =
+                cfg.mode === "SMART" && targetIdx > 0 && rawChunkTexts[targetIdx - 1]
+                  ? rawChunkTexts[targetIdx - 1].slice(-220)
+                  : undefined;
               try {
-                conn = await openLiveWs(initialHint);
+                conn = await openLiveWs(initialHint, prevSourceText);
               } catch (openErr) {
                 // If lockedAutoLang wasn't accepted, safely fall back to auto-detect
                 if (
@@ -1076,7 +1197,7 @@ export default function App() {
                   )
                 ) {
                   lockedAutoLang = null;
-                  conn = await openLiveWs(null);
+                  conn = await openLiveWs(null, prevSourceText);
                 } else {
                   throw openErr;
                 }
@@ -1089,8 +1210,8 @@ export default function App() {
                 onInterim: (txt) => {
                   latestInterim = txt;
                   onActivitySignal?.();
-                  const nowChunk = Math.floor(
-                    (audioElRef.current?.currentTime ?? 0) / 15
+                  const nowChunk = findChunkAtSec(
+                    audioElRef.current?.currentTime ?? 0
                   );
                   if (nowChunk === targetIdx && isAudioPlayingRef.current) {
                     setInterimText(txt);
@@ -1101,8 +1222,8 @@ export default function App() {
                   if (cleaned) {
                     chunkFinalParts.push(cleaned);
                     latestInterim = "";
-                    const nowChunk = Math.floor(
-                      (audioElRef.current?.currentTime ?? 0) / 15
+                    const nowChunk = findChunkAtSec(
+                      audioElRef.current?.currentTime ?? 0
                     );
                     if (nowChunk === targetIdx) {
                       setInterimText("");
@@ -1198,8 +1319,8 @@ export default function App() {
               break;
             }
 
-            const nowChunk = Math.floor(
-              (audioElRef.current?.currentTime ?? 0) / 15
+            const nowChunk = findChunkAtSec(
+              audioElRef.current?.currentTime ?? 0
             );
             if (nowChunk === targetIdx) {
               setInterimText("");
@@ -1213,11 +1334,11 @@ export default function App() {
               break;
             }
 
-            const combinedText = (
+            const combinedText = cleanTranscriptArtifacts(
               chunkFinalParts.length > 0
                 ? chunkFinalParts.join(" ")
                 : latestInterim
-            ).trim();
+            );
 
             const streamedMostlyComplete =
               !interruptedByPause ||
@@ -1256,42 +1377,19 @@ export default function App() {
             }
 
             if (combinedText && !abortController.signal.aborted) {
-              const startMs = Math.round(chunk.startSec * 1000);
-              const actualEndSec = streamedMostlyComplete
-                ? chunk.endSec
-                : Math.min(
-                    chunk.endSec,
-                    chunk.startSec +
-                      (chunk.endSec - chunk.startSec) *
-                        (packetsSent / Math.max(1, chunk.pcmPacketsBase64.length))
-                  );
-              const endMs = Math.round(actualEndSec * 1000);
-              const cues = splitTextIntoTimedCues(combinedText, startMs, endMs);
+              rawChunkTexts[targetIdx] = combinedText;
+              rawChunkLangs[targetIdx] = detectedLang;
+              rawChunkComplete[targetIdx] = streamedMostlyComplete;
+              rawChunkRatio[targetIdx] =
+                packetsSent / Math.max(1, chunk.pcmPacketsBase64.length);
 
-              const newSegments: TranscriptSegment[] = cues.map(
-                (cue, cueIdx) => ({
-                  id: `seg_chunk_${targetIdx}_${cueIdx}_${Date.now()}`,
-                  text: cue.text,
-                  speakerId: "spk_1",
-                  languageCode: detectedLang ?? lockedAutoLang ?? undefined,
-                  timestampMs: cue.startMs,
-                  endTimestampMs: cue.endMs,
-                  chunkIndex: targetIdx,
-                })
-              );
-
-              updateSessionById(newSession.id, (s) => ({
-                ...s,
-                segments: [
-                  ...s.segments.filter((seg) => seg.chunkIndex !== targetIdx),
-                  ...newSegments,
-                ].sort((a, b) => a.timestampMs - b.timestampMs),
-                detectedLanguages:
-                  detectedLang && !s.detectedLanguages.includes(detectedLang)
-                    ? [...s.detectedLanguages, detectedLang]
-                    : s.detectedLanguages,
-                updatedAt: Date.now(),
-              }));
+              commitStitchedChunk(targetIdx);
+              if (
+                targetIdx + 1 < chunks.length &&
+                rawChunkTexts[targetIdx + 1]
+              ) {
+                commitStitchedChunk(targetIdx + 1);
+              }
             }
 
             const abnormalDropWithoutText =
