@@ -14,7 +14,7 @@ import {
 } from "@google/genai";
 import { FrontierModelRouter, classifyGeminiRouterError } from "./server/modelRouter";
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 const LIVE_TRANSCRIBE_MODEL = "gemini-3.5-transcribe-live";
 const STATIC_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 const lmRouter = new FrontierModelRouter();

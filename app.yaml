@@ -1,0 +1,49 @@
+kind: wasmer.io/App.v0
+name: transcriber
+owner: nexuss0781
+package: .
+env:
+  NODE_ENV: production
+  DATA_DIR: /data
+volumes:
+- name: data
+  mount: /data
+annotations:
+  anybuild.run/config:
+    commands:
+      start: node dist/server.js
+    edgejs_enable: true
+    edgejs_precompile: true
+    name: out
+    node_build_command: bun run build
+    node_install_inputs:
+    - package.json
+    node_package_manager: bun
+    node_package_name: transcriber
+    node_remove_native_binaries: true
+    node_server: express
+    bun_version: '1'
+    static_dir: dist
+    node_framework: vite
+  anybuild.run/provider: node-static
+  anybuild.run/version: 0.33.3
+  shipitcli.com/config:
+    build_command: bun run build
+    commands:
+      build: bun run build
+      install: bun install
+      start: node dist/server.js
+    framework: express
+    install_inputs:
+    - package.json
+    name: Transcriber
+    package_manager: bun
+    package_name: transcriber
+    port: 3000
+    precompile_edgejs: true
+    remove_native_binaries: true
+    use_edgejs: true
+  shipitcli.com/provider: node
+  shipitcli.com/version: 0.23.0
+  wasmer.io/version: 7.5.0
+app_id: da_2J7IAtxUd79M
