@@ -1,5 +1,5 @@
-export const WORKERS_PER_WAVE = 3;
-export const MAX_WAVES = 2;
+export const WORKERS_PER_WAVE = 5;
+export const MAX_WAVES = 1;
 
 export interface WaveScheduleParams {
   totalChunks: number;
@@ -13,12 +13,12 @@ export interface WaveScheduleParams {
 
 export function getWaveCount(totalChunks: number): number {
   if (totalChunks <= 0) return 0;
-  return totalChunks === 1 ? 1 : MAX_WAVES;
+  return MAX_WAVES;
 }
 
 /**
- * Picks the next 15-second segment index for a free 3-worker wave.
- * Never picks a segment already completed or currently active in another wave.
+ * Picks the single current 15-second segment index to focus all workers on.
+ * Never picks a segment already completed or currently active.
  */
 export function pickNextWaveSegment(
   params: WaveScheduleParams
@@ -76,5 +76,5 @@ export function shouldInterruptWaveOnSeek(
   if (completed.has(seekedChunkIdx)) {
     return false;
   }
-  return targetIdx !== seekedChunkIdx && targetIdx !== seekedChunkIdx + 1;
+  return targetIdx !== seekedChunkIdx;
 }

@@ -90,7 +90,8 @@ export function applySpeechHighPassFilter(
 }
 
 /**
- * Soft-knee gain conditioning for quiet audio segments without clipping peaks.
+ * Soft-knee gain conditioning for quiet audio segments with smooth peak compression
+ * so soft speech becomes crystal clear without digital clipping.
  */
 export function normalizeSpeechDynamics(samples: Float32Array): Float32Array {
   if (samples.length === 0) return samples;
@@ -103,25 +104,103 @@ export function normalizeSpeechDynamics(samples: Float32Array): Float32Array {
     sumSq += v * v;
   }
   const rms = Math.sqrt(sumSq / samples.length);
-  if (rms < 0.0004 || peak < 1e-5) {
+  if (rms < 0.00035 || peak < 1e-5) {
     return samples;
   }
 
-  // Boost quiet voices toward healthy ~0.10 RMS while capping gain and peak at 0.88
-  const targetRms = 0.1;
-  const desiredGain = rms < targetRms ? Math.min(3.2, targetRms / rms) : 1.0;
-  const maxSafeGain = 0.88 / peak;
-  const gain = Math.min(desiredGain, maxSafeGain);
+  // Lift quiet speech toward a rich ~0.14 RMS, capped at 4.2x and soft-limited cleanly
+  const targetRms = 0.14;
+  const gain = rms < targetRms ? Math.min(4.2, targetRms / rms) : 1.0;
 
-  if (gain <= 1.05) {
+  if (gain <= 1.05 && peak <= 0.88) {
     return samples;
   }
 
   const out = new Float32Array(samples.length);
+  const threshold = 0.84;
+  const headroom = 0.12;
   for (let i = 0; i < samples.length; i++) {
-    out[i] = Math.max(-0.95, Math.min(0.95, samples[i] * gain));
+    const x = samples[i] * gain;
+    const ax = x < 0 ? -x : x;
+    if (ax <= threshold) {
+      out[i] = x;
+    } else {
+      const sign = x < 0 ? -1 : 1;
+      const excess = (ax - threshold) / headroom;
+      out[i] = sign * (threshold + headroom * Math.tanh(excess));
+    }
   }
   return out;
+}
+
+/**
+ * Gentle consonant & vocal-clarity presence emphasis (alpha = 0.32) applied on
+ * already high-pass-filtered speech before soft-knee normalization.
+ */
+export function applyVocalPresenceConditioning(
+  samples: Float32Array
+): Float32Array {
+  if (samples.length === 0) return samples;
+  const emphasized = new Float32Array(samples.length);
+  emphasized[0] = samples[0];
+  for (let i = 1; i < samples.length; i++) {
+    emphasized[i] = samples[i] - 0.32 * samples[i - 1];
+  }
+  return normalizeSpeechDynamics(emphasized);
+}
+
+/**
+ * Stateful streaming conditioner for real-time mic frames so 55Hz high-pass
+ * filtering and gentle adaptive gain carry seamlessly across frame boundaries
+ * with zero edge clicks.
+ */
+export function createStreamingSpeechConditioner(sampleRate = 16000) {
+  const cutoffHz = 55;
+  const rc = 1 / (2 * Math.PI * cutoffHz);
+  const dt = 1 / Math.max(1, sampleRate);
+  const alpha = rc / (rc + dt);
+
+  let prevIn = 0;
+  let prevOut = 0;
+  let smoothedRms = 0.06;
+
+  return (chunk: Float32Array): Float32Array => {
+    if (chunk.length === 0) return chunk;
+    const filtered = new Float32Array(chunk.length);
+    let sumSq = 0;
+    for (let i = 0; i < chunk.length; i++) {
+      const cur = chunk[i];
+      prevOut = alpha * (prevOut + cur - prevIn);
+      prevIn = cur;
+      filtered[i] = prevOut;
+      sumSq += prevOut * prevOut;
+    }
+
+    const frameRms = Math.sqrt(sumSq / chunk.length);
+    if (frameRms > 0.0005) {
+      smoothedRms = smoothedRms * 0.8 + frameRms * 0.2;
+    }
+
+    const gain =
+      smoothedRms > 0.001 && smoothedRms < 0.14
+        ? Math.min(3.5, 0.14 / smoothedRms)
+        : 1.0;
+
+    if (gain <= 1.03) return filtered;
+
+    const out = new Float32Array(filtered.length);
+    for (let i = 0; i < filtered.length; i++) {
+      const x = filtered[i] * gain;
+      const ax = x < 0 ? -x : x;
+      if (ax <= 0.84) {
+        out[i] = x;
+      } else {
+        const sign = x < 0 ? -1 : 1;
+        out[i] = sign * (0.84 + 0.12 * Math.tanh((ax - 0.84) / 0.12));
+      }
+    }
+    return out;
+  };
 }
 
 export function float32ToBase64Pcm16(float32: Float32Array): string {
@@ -149,6 +228,7 @@ export interface AudioPcmChunk {
   speechStartSec: number;
   speechEndSec: number;
   pcmPacketsBase64: string[];
+  clarifiedPacketsBase64: string[];
   rawPacketsBase64: string[];
   hasAudioSignal: boolean;
 }
@@ -188,7 +268,7 @@ export async function sliceAudioFileIntoLiveChunks(
     const snapRadiusSamples = Math.floor(0.45 * srcRate);
     const frameWindowSamples = Math.max(1, Math.floor(0.025 * srcRate));
     const minChunkSamples = Math.floor(2 * srcRate);
-    const leadInSamples = Math.floor(0.55 * srcRate);
+    const leadInSamples = Math.floor(0.65 * srcRate);
     const silentPadPacket = float32ToBase64Pcm16(
       new Float32Array(samplesPerPacket)
     );
@@ -231,17 +311,28 @@ export async function sliceAudioFileIntoLiveChunks(
     const packetize = (samples: Float32Array, hasSignal: boolean): string[] => {
       const ds = downsampleBuffer(samples, srcRate, 16000);
       const pkts: string[] = [];
-      // 256ms silent VAD warm-up lead-in so opening words at 0.00s never clip
+      // 512ms (4x128ms) silent VAD warm-up lead-in so opening words never clip
       if (hasSignal && ds.length > 0) {
-        pkts.push(silentPadPacket, silentPadPacket);
+        pkts.push(
+          silentPadPacket,
+          silentPadPacket,
+          silentPadPacket,
+          silentPadPacket
+        );
       }
       for (let p = 0; p < ds.length; p += samplesPerPacket) {
         const endIdx = Math.min(ds.length, p + samplesPerPacket);
         pkts.push(float32ToBase64Pcm16(ds.subarray(p, endIdx)));
       }
-      // 256ms trailing digital silence flush so final words commit cleanly
-      if (hasSignal && pkts.length > 2) {
-        pkts.push(silentPadPacket, silentPadPacket);
+      // 640ms (5x128ms) trailing digital silence flush so final words commit cleanly
+      if (hasSignal && pkts.length > 4) {
+        pkts.push(
+          silentPadPacket,
+          silentPadPacket,
+          silentPadPacket,
+          silentPadPacket,
+          silentPadPacket
+        );
       }
       return pkts;
     };
@@ -318,6 +409,10 @@ export async function sliceAudioFileIntoLiveChunks(
         normalizeSpeechDynamics(streamSlice),
         hasAudioSignal
       );
+      const clarifiedPacketsBase64 = packetize(
+        applyVocalPresenceConditioning(streamSlice),
+        hasAudioSignal
+      );
       const rawPacketsBase64 = packetize(rawSlice, hasAudioSignal);
 
       chunks.push({
@@ -329,6 +424,7 @@ export async function sliceAudioFileIntoLiveChunks(
         speechEndSec:
           speechEndSec - speechStartSec >= 0.8 ? speechEndSec : endSec,
         pcmPacketsBase64,
+        clarifiedPacketsBase64,
         rawPacketsBase64,
         hasAudioSignal,
       });

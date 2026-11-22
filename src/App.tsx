@@ -45,6 +45,7 @@ import {
   bcp47ToScriptFamily,
   buildExportContent,
   cleanTranscriptArtifacts,
+  createStreamingSpeechConditioner,
   detectScriptFamily,
   downsampleBuffer,
   float32ToBase64Pcm16,
@@ -73,6 +74,18 @@ import {
   mergeWindowRefinedSegments,
   sliceLiveWindowIntoHalves,
 } from "./utils/liveRefiner";
+import {
+  LIVE_LM_INTERVAL_MS,
+  type StructuredWorkerWindow,
+  applyLmRefinedChunksToSegments,
+  applyLmRefinedWindowsToSegments,
+  buildPriorContextSnippet,
+  collectDueRefinementWindows,
+  upsertBackwardWorkerObservations,
+  upsertLiveHqWorkerObservation,
+  upsertLiveWorkerObservation,
+  upsertUploadWorkerObservations,
+} from "./utils/structuredRefine";
 
 const STORAGE_KEY = "transcribe_live_sessions_v1";
 const THEME_KEY = "transcribe_live_theme_v1";
@@ -199,6 +212,7 @@ export default function App() {
 
   // Refs for audio/WebSocket lifecycle without stale closures
   const wsRef = useRef<WebSocket | null>(null);
+  const wsHqRef = useRef<WebSocket | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
@@ -237,6 +251,10 @@ export default function App() {
     reconnectTimer: number | null;
     reconnectAttempts: number;
     isStopping: boolean;
+    structuredWindows: Map<number, StructuredWorkerWindow>;
+    inFlightBackwardPromises: Set<Promise<void>>;
+    lmIntervalTimer: number | null;
+    lmActivePromise: Promise<void> | null;
   }>({
     runId: 0,
     chunks: [],
@@ -257,7 +275,16 @@ export default function App() {
     reconnectTimer: null,
     reconnectAttempts: 0,
     isStopping: false,
+    structuredWindows: new Map(),
+    inFlightBackwardPromises: new Set(),
+    lmIntervalTimer: null,
+    lmActivePromise: null,
   });
+
+  const sessionsRef = useRef<TranscriptionSession[]>(sessions);
+  useEffect(() => {
+    sessionsRef.current = sessions;
+  }, [sessions]);
 
   useEffect(() => {
     activeSessionIdRef.current = activeSessionId;
@@ -343,6 +370,119 @@ export default function App() {
     });
   }, []);
 
+  const runLmRefinementPass = useCallback(
+    async (
+      runId: number,
+      targetSessionId: string,
+      signal: AbortSignal,
+      forceFlush = false
+    ) => {
+      const lp = livePipelineRef.current;
+      if (lp.runId !== runId || signal.aborted) return;
+
+      if (lp.lmActivePromise) {
+        if (!forceFlush) return;
+        await lp.lmActivePromise.catch(() => {});
+        if (lp.runId !== runId || signal.aborted) return;
+      }
+
+      const executePass = async () => {
+        const due = collectDueRefinementWindows(lp.structuredWindows);
+        if (due.length === 0) return;
+
+        const targetSess = sessionsRef.current.find(
+          (s) => s.id === targetSessionId
+        );
+        const priorContext = buildPriorContextSnippet(
+          targetSess?.segments ?? [],
+          due[0].windowIndex,
+          600
+        );
+
+        try {
+          const res = await fetch("/api/refine-transcript", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              windows: due,
+              priorContext,
+              languageCode: lp.configSnapshot.languageCode,
+              customVocabulary: lp.configSnapshot.customVocabulary,
+              scope: "live_6w",
+            }),
+            signal,
+          });
+          if (!res.ok) return;
+
+          const data = (await res.json()) as {
+            refinedWindows?: Array<{
+              windowIndex: number;
+              refinedText: string;
+              detectedLanguage?: string;
+            }>;
+          };
+
+          if (
+            signal.aborted ||
+            lp.runId !== runId ||
+            !Array.isArray(data.refinedWindows) ||
+            data.refinedWindows.length === 0
+          ) {
+            return;
+          }
+
+          for (const item of data.refinedWindows) {
+            const winEntry = lp.structuredWindows.get(item.windowIndex);
+            if (winEntry) {
+              winEntry.lmRefined = true;
+            }
+          }
+
+          const fallbackLang =
+            lp.lockedAutoLang ??
+            (lp.configSnapshot.languageCode === "auto"
+              ? undefined
+              : lp.configSnapshot.languageCode);
+
+          const detectedFromLm = data.refinedWindows
+            .map((w) => w.detectedLanguage)
+            .filter((l): l is string => Boolean(l));
+
+          updateSessionById(targetSessionId, (s) => {
+            let mergedLangs = s.detectedLanguages;
+            for (const nl of detectedFromLm) {
+              if (!mergedLangs.includes(nl)) {
+                mergedLangs = [...mergedLangs, nl];
+              }
+            }
+            return {
+              ...s,
+              segments: applyLmRefinedWindowsToSegments(
+                s.segments,
+                lp.structuredWindows,
+                data.refinedWindows!,
+                fallbackLang
+              ),
+              detectedLanguages: mergedLangs,
+              updatedAt: Date.now(),
+            };
+          });
+        } catch {
+          // Stay silent under the hood; keep windows queued for next minute pass
+        }
+      };
+
+      const task = executePass().finally(() => {
+        if (lp.lmActivePromise === task) {
+          lp.lmActivePromise = null;
+        }
+      });
+      lp.lmActivePromise = task;
+      await task;
+    },
+    [updateSessionById]
+  );
+
   const refineLiveWindow = useCallback(
     async (
       sliced: SlicedLiveWindow,
@@ -361,16 +501,15 @@ export default function App() {
         if (signal.aborted) return;
 
         if (!sliced.hasAudioSignal) {
-          updateSessionById(targetSessionId, (s) => ({
-            ...s,
-            segments: mergeWindowRefinedSegments(s.segments, {
-              windowIndex: sliced.windowIndex,
-              windowStartMs: sliced.windowStartMs,
-              windowEndMs: sliced.windowEndMs,
-              refinedSegments: [],
-            }),
-            updatedAt: Date.now(),
-          }));
+          if (lp.runId === runId) {
+            upsertBackwardWorkerObservations(
+              lp.structuredWindows,
+              sliced.windowIndex,
+              sliced.windowStartMs,
+              sliced.windowEndMs,
+              {}
+            );
+          }
           return;
         }
 
@@ -453,7 +592,7 @@ export default function App() {
                 });
               };
 
-              const resetIdle = (ms = 1350) => {
+              const resetIdle = (ms = 2500) => {
                 if (idleTimer !== null) window.clearTimeout(idleTimer);
                 idleTimer = window.setTimeout(finish, ms);
               };
@@ -491,7 +630,7 @@ export default function App() {
                 if (msg.type === "ready") {
                   maxTimer = window.setTimeout(
                     finish,
-                    packets.length * intervalMs + 5500
+                    packets.length * intervalMs + 9000
                   );
                   for (let p = 0; p < packets.length; p++) {
                     if (
@@ -512,7 +651,7 @@ export default function App() {
                     ws.readyState === WebSocket.OPEN
                   ) {
                     ws.send(JSON.stringify({ type: "audioStreamEnd" }));
-                    resetIdle(1350);
+                    resetIdle(2500);
                   } else {
                     finish();
                   }
@@ -521,7 +660,7 @@ export default function App() {
 
                 if (msg.type === "interim") {
                   if (msg.text) latestInterim = msg.text;
-                  resetIdle(1350);
+                  resetIdle(2500);
                   return;
                 }
 
@@ -532,7 +671,7 @@ export default function App() {
                     latestInterim = "";
                   }
                   if (msg.languageCode) detectedLang = msg.languageCode;
-                  resetIdle(1350);
+                  resetIdle(2500);
                   return;
                 }
 
@@ -575,7 +714,8 @@ export default function App() {
         const activeHalves = sliced.halves.filter((h) => h.hasAudioSignal);
         if (activeHalves.length === 0) return;
 
-        // 4 independent backward workers run concurrently (2 on first 5s + 2 on later 5s)
+        // 4 independent backward workers run concurrently at exact 1.0x 128ms cadence
+        // (2 on first 5s + 2 on later 5s: 1 high-quality conditioned + 1 raw wave per half)
         const contrastMode: "VERBATIM" | "SMART" =
           configSnapshot.mode === "SMART" ? "VERBATIM" : "SMART";
 
@@ -589,21 +729,21 @@ export default function App() {
             const langSnapshot = lp.runId === runId ? lp.lockedAutoLang : null;
 
             const workers = await Promise.all([
-              // Worker A (Filtered + normalized speech dynamics, configured mode)
+              // Worker A (High-quality conditioned speech wave, configured mode, true 128ms pace)
               runBackwardSinglePass(
                 half,
                 false,
                 configSnapshot.mode,
-                102,
+                128,
                 langSnapshot,
                 prevText
               ),
-              // Worker B (Raw wideband complement, contrasting mode)
+              // Worker B (Raw input wave, contrasting mode, true 128ms pace)
               runBackwardSinglePass(
                 half,
                 true,
                 contrastMode,
-                106,
+                128,
                 langSnapshot,
                 prevText
               ),
@@ -759,13 +899,32 @@ export default function App() {
               endTimestampMs: cue.endMs,
               liveWindowIndex: sliced.windowIndex,
               liveHalfIndex: half.halfIndex,
-              isProvisional: false,
-              isRefined: true,
+              isProvisional: true,
+              isRefined: false,
             });
           });
         }
 
         if (signal.aborted) return;
+
+        // Preserve all 4 backward worker outputs independently alongside Worker 1
+        // without discarding or letting one worker override another.
+        if (lp.runId === runId) {
+          const half0Pair = halfPairOutputs.find((hp) => hp.half.halfIndex === 0);
+          const half1Pair = halfPairOutputs.find((hp) => hp.half.halfIndex === 1);
+          upsertBackwardWorkerObservations(
+            lp.structuredWindows,
+            sliced.windowIndex,
+            sliced.windowStartMs,
+            sliced.windowEndMs,
+            {
+              firstHalfPrimary: half0Pair?.workers[0]?.text ?? "",
+              firstHalfContrast: half0Pair?.workers[1]?.text ?? "",
+              secondHalfPrimary: half1Pair?.workers[0]?.text ?? "",
+              secondHalfContrast: half1Pair?.workers[1]?.text ?? "",
+            }
+          );
+        }
 
         updateSessionById(targetSessionId, (s) => {
           let mergedLangs = s.detectedLanguages;
@@ -774,14 +933,27 @@ export default function App() {
               mergedLangs = [...mergedLangs, nl];
             }
           }
+
+          // Do not overwrite Worker 1's provisional stream with backward workers;
+          // wait for the 1-minute LM pass unless Worker 1 dropped with zero text.
+          const hasWorker1OrEditedText = s.segments.some(
+            (seg) =>
+              seg.liveWindowIndex === sliced.windowIndex &&
+              seg.text.trim().length > 0
+          );
+
+          const nextSegments = hasWorker1OrEditedText
+            ? s.segments
+            : mergeWindowRefinedSegments(s.segments, {
+                windowIndex: sliced.windowIndex,
+                windowStartMs: sliced.windowStartMs,
+                windowEndMs: sliced.windowEndMs,
+                refinedSegments: refinedWindowSegments,
+              });
+
           return {
             ...s,
-            segments: mergeWindowRefinedSegments(s.segments, {
-              windowIndex: sliced.windowIndex,
-              windowStartMs: sliced.windowStartMs,
-              windowEndMs: sliced.windowEndMs,
-              refinedSegments: refinedWindowSegments,
-            }),
+            segments: nextSegments,
             detectedLanguages: mergedLangs,
             durationMs: Math.max(s.durationMs, sliced.windowEndMs),
             updatedAt: Date.now(),
@@ -846,12 +1018,17 @@ export default function App() {
 
   const stopRecording = useCallback(() => {
     const lp = livePipelineRef.current;
+    const stopRunId = lp.runId;
     liveRecordingActiveRef.current = false;
     lp.isStopping = true;
 
     if (lp.reconnectTimer !== null) {
       window.clearTimeout(lp.reconnectTimer);
       lp.reconnectTimer = null;
+    }
+    if (lp.lmIntervalTimer !== null) {
+      window.clearInterval(lp.lmIntervalTimer);
+      lp.lmIntervalTimer = null;
     }
 
     const targetSessionId = lp.targetSessionId || activeSessionIdRef.current;
@@ -873,35 +1050,37 @@ export default function App() {
     setConnectionState("stopping");
     isPausedRef.current = false;
 
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      try {
-        wsRef.current.send(JSON.stringify({ type: "stop" }));
-      } catch {
-        // ignore
-      }
-      const closingWs = wsRef.current;
-      wsRef.current = null;
-      setTimeout(() => {
+    for (const liveSock of [wsRef.current, wsHqRef.current]) {
+      if (!liveSock) continue;
+      if (liveSock.readyState === WebSocket.OPEN) {
         try {
-          closingWs.close();
+          liveSock.send(JSON.stringify({ type: "stop" }));
         } catch {
           // ignore
         }
-      }, 300);
-    } else if (wsRef.current) {
-      try {
-        wsRef.current.close();
-      } catch {
-        // ignore
+        setTimeout(() => {
+          try {
+            liveSock.close();
+          } catch {
+            // ignore
+          }
+        }, 300);
+      } else {
+        try {
+          liveSock.close();
+        } catch {
+          // ignore
+        }
       }
-      wsRef.current = null;
     }
+    wsRef.current = null;
+    wsHqRef.current = null;
 
     cleanupAudioPipeline();
 
-    // Flush any remaining recorded partial window (>= 0.4s) to backward workers on Stop
+    // Flush any remaining recorded partial window (>= 0.25s) to backward workers on Stop
     const leftoverCount = lp.count;
-    const minTailSamples = Math.floor(LIVE_SAMPLE_RATE * 0.4);
+    const minTailSamples = Math.floor(LIVE_SAMPLE_RATE * 0.25);
     if (
       leftoverCount >= minTailSamples &&
       liveRefineAbortRef.current &&
@@ -922,16 +1101,36 @@ export default function App() {
         windowStartMs: tailWinStartMs,
       });
       lp.prevTailSamples = slicedTail.tailSamples;
-      void refineLiveWindow(
+      const tailPromise = refineLiveWindow(
         slicedTail,
         lp.runId,
         targetSessionId,
         lp.configSnapshot,
         liveRefineAbortRef.current.signal
       );
+      lp.inFlightBackwardPromises.add(tailPromise);
+      void tailPromise.finally(() => {
+        lp.inFlightBackwardPromises.delete(tailPromise);
+      });
     } else {
       lp.chunks = [];
       lp.count = 0;
+    }
+
+    // Wait for all active backward workers on this run, then flush final LM pass silently
+    const abortSignal = liveRefineAbortRef.current?.signal;
+    const pendingBackward = Array.from(lp.inFlightBackwardPromises);
+    if (abortSignal && !abortSignal.aborted) {
+      void Promise.allSettled(pendingBackward).then(() => {
+        if (lp.runId === stopRunId && !abortSignal.aborted) {
+          return runLmRefinementPass(
+            stopRunId,
+            targetSessionId,
+            abortSignal,
+            true
+          );
+        }
+      });
     }
 
     setInterimText("");
@@ -939,19 +1138,37 @@ export default function App() {
     setInterimLanguage("");
     setConnectionState("idle");
     syncLiveRefinementUI(true);
-  }, [cleanupAudioPipeline, refineLiveWindow, syncLiveRefinementUI, updateSessionById]);
+  }, [
+    cleanupAudioPipeline,
+    refineLiveWindow,
+    runLmRefinementPass,
+    syncLiveRefinementUI,
+    updateSessionById,
+  ]);
 
   useEffect(() => {
     return () => {
       liveRecordingActiveRef.current = false;
+      const lp = livePipelineRef.current;
+      if (lp.reconnectTimer !== null) {
+        window.clearTimeout(lp.reconnectTimer);
+        lp.reconnectTimer = null;
+      }
+      if (lp.lmIntervalTimer !== null) {
+        window.clearInterval(lp.lmIntervalTimer);
+        lp.lmIntervalTimer = null;
+      }
+      lp.lmActivePromise = null;
       cleanupAudioPipeline();
       uploadAbortRef.current?.abort();
       liveRefineAbortRef.current?.abort();
-      if (wsRef.current) {
-        try {
-          wsRef.current.close();
-        } catch {
-          // ignore
+      for (const sock of [wsRef.current, wsHqRef.current]) {
+        if (sock) {
+          try {
+            sock.close();
+          } catch {
+            // ignore
+          }
         }
       }
     };
@@ -1008,6 +1225,9 @@ export default function App() {
     if (livePipelineRef.current.reconnectTimer !== null) {
       window.clearTimeout(livePipelineRef.current.reconnectTimer);
     }
+    if (livePipelineRef.current.lmIntervalTimer !== null) {
+      window.clearInterval(livePipelineRef.current.lmIntervalTimer);
+    }
 
     livePipelineRef.current = {
       runId,
@@ -1033,7 +1253,28 @@ export default function App() {
       reconnectTimer: null,
       reconnectAttempts: 0,
       isStopping: false,
+      structuredWindows: new Map(),
+      inFlightBackwardPromises: new Set(),
+      lmIntervalTimer: null,
+      lmActivePromise: null,
     };
+
+    // Run under-the-hood LM multi-worker synthesis once every 60 seconds
+    livePipelineRef.current.lmIntervalTimer = window.setInterval(() => {
+      if (
+        !isPausedRef.current &&
+        liveRecordingActiveRef.current &&
+        !refineController.signal.aborted
+      ) {
+        void runLmRefinementPass(
+          runId,
+          targetSessionId,
+          refineController.signal,
+          false
+        );
+      }
+    }, LIVE_LM_INTERVAL_MS);
+
     liveRecordingActiveRef.current = true;
     syncLiveRefinementUI(true);
 
@@ -1044,19 +1285,36 @@ export default function App() {
         );
       }
 
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          deviceId: selectedDeviceId ? { exact: selectedDeviceId } : undefined,
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            deviceId: selectedDeviceId ? { exact: selectedDeviceId } : undefined,
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: { ideal: false },
+            autoGainControl: { ideal: false },
+          },
+        });
+      } catch {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            deviceId: selectedDeviceId ? { exact: selectedDeviceId } : undefined,
+            channelCount: 1,
+            echoCancellation: true,
+          },
+        });
+      }
       streamRef.current = stream;
       void refreshAudioDevices();
 
-      const audioCtx = new AudioContext({ sampleRate: LIVE_SAMPLE_RATE });
+      // Prefer hardware native sample rate so downsampleBuffer performs clean 3:1 anti-aliased decimation
+      let audioCtx: AudioContext;
+      try {
+        audioCtx = new AudioContext();
+      } catch {
+        audioCtx = new AudioContext({ sampleRate: LIVE_SAMPLE_RATE });
+      }
       audioCtxRef.current = audioCtx;
       if (audioCtx.state === "suspended") {
         await audioCtx.resume();
@@ -1077,6 +1335,8 @@ export default function App() {
       const wsEndpoint = `${protocol}//${window.location.host}/ws/transcribe`;
       let rotatingSocket = false;
       let micStartedListening = false;
+      const hqStreamConditioner =
+        createStreamingSpeechConditioner(LIVE_SAMPLE_RATE);
 
       const ensureMicListeningState = () => {
         if (
@@ -1116,11 +1376,19 @@ export default function App() {
           LIVE_SAMPLE_RATE
         );
 
-        // 1) Forward raw live audio frame to the Live Voice Worker if open
+        // 1A) Forward raw un-conditioned wave to Real-Time Raw Worker
         const activeWs = wsRef.current;
         if (activeWs && activeWs.readyState === WebSocket.OPEN) {
-          const base64 = float32ToBase64Pcm16(downsampled);
-          activeWs.send(JSON.stringify({ type: "audio", data: base64 }));
+          const rawBase64 = float32ToBase64Pcm16(downsampled);
+          activeWs.send(JSON.stringify({ type: "audio", data: rawBase64 }));
+        }
+
+        // 1B) Forward click-free 55Hz HPF + RMS-leveled High-Quality wave to Real-Time HQ Worker
+        const activeHqWs = wsHqRef.current;
+        if (activeHqWs && activeHqWs.readyState === WebSocket.OPEN) {
+          const hqWave = hqStreamConditioner(downsampled);
+          const hqBase64 = float32ToBase64Pcm16(hqWave);
+          activeHqWs.send(JSON.stringify({ type: "audio", data: hqBase64 }));
         }
 
         // 2) Buffer into the rolling 10-second live window; once 10s is reached,
@@ -1150,16 +1418,141 @@ export default function App() {
           });
           lp.prevTailSamples = sliced.tailSamples;
 
-          void refineLiveWindow(
+          const winPromise = refineLiveWindow(
             sliced,
             runId,
             targetSessionId,
             cfgSnapshot,
             refineController.signal
           );
+          lp.inFlightBackwardPromises.add(winPromise);
+          void winPromise.finally(() => {
+            lp.inFlightBackwardPromises.delete(winPromise);
+          });
         }
 
         syncLiveRefinementUI(extracted.completedWindows.length > 0);
+      };
+
+      const attachHqLiveSocket = () => {
+        const lp = livePipelineRef.current;
+        if (
+          !liveRecordingActiveRef.current ||
+          lp.runId !== runId ||
+          lp.isStopping
+        ) {
+          return;
+        }
+        const prevHqWs = wsHqRef.current;
+        const hqWs = new WebSocket(wsEndpoint);
+        wsHqRef.current = hqWs;
+        const hqMode: "VERBATIM" | "SMART" =
+          cfgSnapshot.mode === "SMART" ? "VERBATIM" : "SMART";
+
+        hqWs.onopen = () => {
+          hqWs.send(
+            JSON.stringify({
+              type: "start",
+              mode: hqMode,
+              languageCodes:
+                cfgSnapshot.languageCode === "auto"
+                  ? []
+                  : [cfgSnapshot.languageCode],
+              customVocabulary: cfgSnapshot.customVocabulary,
+            })
+          );
+        };
+
+        hqWs.onmessage = (event) => {
+          if (lp.runId !== runId || lp.isStopping) return;
+          let msg: {
+            type: string;
+            text?: string;
+            languageCode?: string;
+          };
+          try {
+            msg = JSON.parse(String(event.data));
+          } catch {
+            return;
+          }
+          if (msg.type === "ready" && prevHqWs && prevHqWs !== hqWs) {
+            try {
+              if (prevHqWs.readyState === WebSocket.OPEN) {
+                prevHqWs.send(JSON.stringify({ type: "stop" }));
+              }
+              prevHqWs.close();
+            } catch {
+              // ignore
+            }
+            return;
+          }
+          if (msg.type === "transcript") {
+            const cleanText = cleanTranscriptArtifacts(msg.text ?? "");
+            if (!cleanText) return;
+            const currentElapsed =
+              lp.recordingStartOffsetMs +
+              Math.round((lp.totalRecordedSamples / LIVE_SAMPLE_RATE) * 1000);
+            const liveWinIdx = Math.floor(
+              lp.totalRecordedSamples / LIVE_WINDOW_SAMPLES
+            );
+            const winStartMs =
+              lp.recordingStartOffsetMs +
+              liveWinIdx * LIVE_WINDOW_SECONDS * 1000;
+            const winEndMs = winStartMs + LIVE_WINDOW_SECONDS * 1000;
+            upsertLiveHqWorkerObservation(
+              lp.structuredWindows,
+              liveWinIdx,
+              winStartMs,
+              winEndMs,
+              cleanText
+            );
+
+            // If Worker 1A dropped, seamlessly show Worker 1B's real-time HQ draft
+            if (lp.liveWorkerStatus === "dropped") {
+              updateSessionById(targetSessionId, (s) => {
+                if (
+                  lp.structuredWindows.get(liveWinIdx)?.lmRefined ||
+                  s.segments.some(
+                    (seg) =>
+                      seg.liveWindowIndex === liveWinIdx && Boolean(seg.isRefined)
+                  )
+                ) {
+                  return s;
+                }
+                return {
+                  ...s,
+                  segments: [
+                    ...s.segments,
+                    {
+                      id: `seg_hq_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+                      text: cleanText,
+                      speakerId: "spk_1",
+                      languageCode: msg.languageCode,
+                      timestampMs: currentElapsed,
+                      liveWindowIndex: liveWinIdx,
+                      isProvisional: true,
+                    },
+                  ],
+                  durationMs: Math.max(s.durationMs, currentElapsed),
+                  updatedAt: Date.now(),
+                };
+              });
+            }
+          } else if (
+            msg.type === "goAway" &&
+            wsHqRef.current === hqWs &&
+            liveRecordingActiveRef.current &&
+            !lp.isStopping
+          ) {
+            attachHqLiveSocket();
+          }
+        };
+
+        hqWs.onclose = () => {
+          if (wsHqRef.current === hqWs) {
+            wsHqRef.current = null;
+          }
+        };
       };
 
       const attachMicSocket = (isReplacement: boolean) => {
@@ -1302,16 +1695,33 @@ export default function App() {
               lp.totalRecordedSamples / LIVE_WINDOW_SAMPLES
             );
 
+            // Preserve Worker 1A's independent real-time transcription in structured store
+            if (lp.runId === runId) {
+              const winStartMs =
+                lp.recordingStartOffsetMs +
+                liveWinIdx * LIVE_WINDOW_SECONDS * 1000;
+              const winEndMs = winStartMs + LIVE_WINDOW_SECONDS * 1000;
+              upsertLiveWorkerObservation(
+                lp.structuredWindows,
+                liveWinIdx,
+                winStartMs,
+                winEndMs,
+                cleanText
+              );
+            }
+
             const speakerId = msg.speakerLabel || "spk_1";
             const lang = msg.languageCode;
             const now = Date.now();
 
             updateSessionById(targetSessionId, (s) => {
-              // If the 4 backward workers already refined this window, don't inject stale drafts
-              const windowAlreadyRefined = s.segments.some(
-                (seg) =>
-                  seg.liveWindowIndex === liveWinIdx && Boolean(seg.isRefined)
-              );
+              // If the 1-minute LM pass already refined this window, don't inject stale drafts
+              const windowAlreadyRefined =
+                Boolean(lp.structuredWindows.get(liveWinIdx)?.lmRefined) ||
+                s.segments.some(
+                  (seg) =>
+                    seg.liveWindowIndex === liveWinIdx && Boolean(seg.isRefined)
+                );
               if (windowAlreadyRefined) {
                 return s;
               }
@@ -1386,14 +1796,17 @@ export default function App() {
               cleanupAudioPipeline();
               setConnectionState("error");
               syncLiveRefinementUI(true);
-              if (wsRef.current) {
-                try {
-                  wsRef.current.close();
-                } catch {
-                  // ignore
+              for (const sock of [wsRef.current, wsHqRef.current]) {
+                if (sock) {
+                  try {
+                    sock.close();
+                  } catch {
+                    // ignore
+                  }
                 }
-                wsRef.current = null;
               }
+              wsRef.current = null;
+              wsHqRef.current = null;
               return;
             }
             if (isReplacement && wsRef.current !== ws) {
@@ -1430,6 +1843,7 @@ export default function App() {
       };
 
       attachMicSocket(false);
+      attachHqLiveSocket();
 
       let workletAttached = false;
       if (audioCtx.audioWorklet) {
@@ -1487,6 +1901,7 @@ export default function App() {
     connectionState,
     refineLiveWindow,
     refreshAudioDevices,
+    runLmRefinementPass,
     selectedDeviceId,
     syncLiveRefinementUI,
     updateSessionById,
@@ -1499,8 +1914,10 @@ export default function App() {
         runStartRef.current > 0 ? Date.now() - runStartRef.current : 0;
       runStartRef.current = 0;
       setLiveDurationMs(accumulatedMsRef.current);
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ type: "audioStreamEnd" }));
+      for (const sock of [wsRef.current, wsHqRef.current]) {
+        if (sock && sock.readyState === WebSocket.OPEN) {
+          sock.send(JSON.stringify({ type: "audioStreamEnd" }));
+        }
       }
       setConnectionState("paused");
     } else if (connectionState === "paused") {
@@ -1545,8 +1962,8 @@ export default function App() {
           completedChunks: 0,
           completedChunkIndices: [],
           activeChunkIndices: [],
-          waveCount: 2,
-          workerCount: 6,
+          waveCount: 1,
+          workerCount: WORKERS_PER_WAVE,
           readyWorkers: 0,
           preRollStage: "segmenting",
           isBuffering: true,
@@ -1764,7 +2181,112 @@ export default function App() {
         const rawChunkRatio: number[] = chunks.map(() => 1);
         const activeChunksSet = new Set<number>();
         const completedSet = new Set<number>();
+        const uploadStructuredWindows = new Map<
+          number,
+          StructuredWorkerWindow
+        >();
+        let uploadLmInFlight: Promise<void> | null = null;
         let fatalError: string | null = null;
+
+        const runUploadLmRefinementPass = async () => {
+          if (abortController.signal.aborted) return;
+          if (uploadLmInFlight) {
+            await uploadLmInFlight.catch(() => {});
+            if (abortController.signal.aborted) return;
+          }
+
+          const executeUploadPass = async () => {
+            const due = collectDueRefinementWindows(uploadStructuredWindows);
+            if (due.length === 0) return;
+
+            const currentSess = sessionsRef.current.find(
+              (s) => s.id === newSession.id
+            );
+            const priorContext = buildPriorContextSnippet(
+              currentSess?.segments ?? [],
+              due[0].windowIndex,
+              600,
+              "chunkIndex"
+            );
+
+            try {
+              const res = await fetch("/api/refine-transcript", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  windows: due,
+                  priorContext,
+                  languageCode: cfg.languageCode,
+                  customVocabulary: cfg.customVocabulary,
+                  scope: "upload_5w",
+                }),
+                signal: abortController.signal,
+              });
+              if (!res.ok) return;
+
+              const data = (await res.json()) as {
+                refinedWindows?: Array<{
+                  windowIndex: number;
+                  refinedText: string;
+                  detectedLanguage?: string;
+                }>;
+              };
+
+              if (
+                abortController.signal.aborted ||
+                !Array.isArray(data.refinedWindows) ||
+                data.refinedWindows.length === 0
+              ) {
+                return;
+              }
+
+              for (const item of data.refinedWindows) {
+                const entry = uploadStructuredWindows.get(item.windowIndex);
+                if (entry) {
+                  entry.lmRefined = true;
+                }
+              }
+
+              const fallbackLang =
+                lockedAutoLang ??
+                (cfg.languageCode === "auto" ? undefined : cfg.languageCode);
+
+              const detectedFromLm = data.refinedWindows
+                .map((w) => w.detectedLanguage)
+                .filter((l): l is string => Boolean(l));
+
+              updateSessionById(newSession.id, (s) => {
+                let mergedLangs = s.detectedLanguages;
+                for (const nl of detectedFromLm) {
+                  if (!mergedLangs.includes(nl)) {
+                    mergedLangs = [...mergedLangs, nl];
+                  }
+                }
+                return {
+                  ...s,
+                  segments: applyLmRefinedChunksToSegments(
+                    s.segments,
+                    uploadStructuredWindows,
+                    data.refinedWindows!,
+                    fallbackLang
+                  ),
+                  detectedLanguages: mergedLangs,
+                  updatedAt: Date.now(),
+                };
+              });
+            } catch {
+              // Silent under the hood; pending chunks stay queued for next minute/flush
+            }
+          };
+
+          const task = executeUploadPass().finally(() => {
+            if (uploadLmInFlight === task) {
+              uploadLmInFlight = null;
+            }
+          });
+          uploadLmInFlight = task;
+          await task;
+        };
 
         const findChunkAtSec = (sec: number) => {
           const found = chunks.findIndex(
@@ -1912,7 +2434,14 @@ export default function App() {
           );
         };
 
-        // Pre-warm up to 2 waves (3 workers per wave = 6 workers) concurrently before transcribing
+        // Pre-warm all 5 focused workers for the single current segment wave
+        const PASS_MODES: Array<"VERBATIM" | "SMART"> = [
+          "VERBATIM",
+          "SMART",
+          "VERBATIM",
+          "SMART",
+          cfg.mode,
+        ];
         let preWarmedWaves: Array<
           Array<Awaited<ReturnType<typeof openLiveWs>> | null>
         > = [];
@@ -1921,7 +2450,7 @@ export default function App() {
             Array.from({ length: waveCount }, () =>
               Promise.all(
                 Array.from({ length: WORKERS_PER_WAVE }, async (_, idx) => {
-                  const modeForPass = idx === 2 ? "SMART" : cfg.mode;
+                  const modeForPass = PASS_MODES[idx] ?? cfg.mode;
                   const conn = await openLiveWs(
                     lockedAutoLang,
                     undefined,
@@ -1949,15 +2478,19 @@ export default function App() {
 
         interface WorkerPassSpec {
           passId: number;
-          useRaw: boolean;
+          waveType: "raw" | "hq" | "clarified";
           mode: "VERBATIM" | "SMART";
           intervalMs: number;
         }
 
+        // 5 parallel workers focused on the single current segment at true 1.0x (128ms) speed:
+        // 2 Raw Input Wave workers (VERBATIM + SMART) + 3 High-Quality Conditioned Wave workers
         const PASS_SPECS: WorkerPassSpec[] = [
-          { passId: 0, useRaw: true, mode: cfg.mode, intervalMs: 118 },
-          { passId: 1, useRaw: false, mode: "VERBATIM", intervalMs: 112 },
-          { passId: 2, useRaw: false, mode: "SMART", intervalMs: 115 },
+          { passId: 0, waveType: "raw", mode: "VERBATIM", intervalMs: 128 },
+          { passId: 1, waveType: "raw", mode: "SMART", intervalMs: 128 },
+          { passId: 2, waveType: "hq", mode: "VERBATIM", intervalMs: 128 },
+          { passId: 3, waveType: "hq", mode: "SMART", intervalMs: 128 },
+          { passId: 4, waveType: "clarified", mode: cfg.mode, intervalMs: 128 },
         ];
 
         const runSinglePassOnSegment = async (
@@ -1967,9 +2500,12 @@ export default function App() {
           forcedLangHint?: string | null
         ) => {
           const chunk = chunks[targetIdx];
-          const packets = spec.useRaw
-            ? chunk.rawPacketsBase64
-            : chunk.pcmPacketsBase64;
+          const packets =
+            spec.waveType === "raw"
+              ? chunk.rawPacketsBase64
+              : spec.waveType === "clarified"
+                ? chunk.clarifiedPacketsBase64
+                : chunk.pcmPacketsBase64;
           const startSeekSeq = uploadSeekSeqRef.current;
 
           let conn: Awaited<ReturnType<typeof openLiveWs>> | null = null;
@@ -2110,8 +2646,8 @@ export default function App() {
 
               await new Promise<void>((resolve) => {
                 let settled = false;
-                const idleDelay = interruptedByControl ? 450 : 1500;
-                const maxDelay = interruptedByControl ? 750 : 6000;
+                const idleDelay = interruptedByControl ? 450 : 2500;
+                const maxDelay = interruptedByControl ? 750 : 9000;
                 let idleTimer = window.setTimeout(() => done(), idleDelay);
                 const maxTimer = window.setTimeout(() => done(), maxDelay);
 
@@ -2207,7 +2743,7 @@ export default function App() {
               return c;
             });
 
-            // Run all 3 focused workers TOGETHER on this exact 15s segment
+            // Run all 5 focused workers TOGETHER on this single current 15s segment
             const results = await Promise.all(
               PASS_SPECS.map((spec, idx) =>
                 runSinglePassOnSegment(targetIdx, spec, passPreConns[idx])
@@ -2244,7 +2780,7 @@ export default function App() {
               (r) => r.streamedMostlyComplete
             );
 
-            // Reconcile across all 3 workers on this 15s segment
+            // Reconcile across all 5 workers on this current 15s segment
             let reconciled = reconcileFocusedTranscripts(
               results.map((r) => ({
                 text: r.text,
@@ -2279,6 +2815,7 @@ export default function App() {
               (hasMixedLatinWithNonLatin(reconciled.text) ||
                 detectScriptFamily(reconciled.text) !== lockedScriptFamily);
 
+            let verifiedSupplement = "";
             if (
               lockedAutoLang &&
               reconciled.text &&
@@ -2289,10 +2826,18 @@ export default function App() {
             ) {
               const verified = await runSinglePassOnSegment(
                 targetIdx,
-                { passId: 0, useRaw: false, mode: cfg.mode, intervalMs: 115 },
+                {
+                  passId: 2,
+                  waveType: "hq",
+                  mode: cfg.mode,
+                  intervalMs: 128,
+                },
                 null,
                 lockedAutoLang
               );
+              if (verified.text) {
+                verifiedSupplement = verified.text;
+              }
               if (
                 verified.text &&
                 detectScriptFamily(verified.text) === lockedScriptFamily &&
@@ -2310,6 +2855,36 @@ export default function App() {
               rawChunkLangs[targetIdx] = reconciled.lang;
               rawChunkComplete[targetIdx] = anyMostlyComplete;
               rawChunkRatio[targetIdx] = allCompletedRatio;
+
+              const cStartMs = Math.round(
+                (anyMostlyComplete ? chunk.speechStartSec : chunk.startSec) *
+                  1000
+              );
+              const cActualEndSec = anyMostlyComplete
+                ? chunk.speechEndSec
+                : Math.min(
+                    chunk.endSec,
+                    chunk.startSec +
+                      (chunk.endSec - chunk.startSec) * allCompletedRatio
+                  );
+              const cEndMs = Math.max(
+                cStartMs + 600,
+                Math.round(cActualEndSec * 1000)
+              );
+
+              upsertUploadWorkerObservations(
+                uploadStructuredWindows,
+                targetIdx,
+                cStartMs,
+                cEndMs,
+                {
+                  worker0RawPrimary: results[0]?.text ?? "",
+                  worker1RawContrast: results[1]?.text ?? "",
+                  worker2HqVerbatim: verifiedSupplement || (results[2]?.text ?? ""),
+                  worker3HqSmart: results[3]?.text ?? "",
+                  worker4HqClarified: results[4]?.text ?? "",
+                }
+              );
 
               commitStitchedChunk(targetIdx);
               if (
@@ -2352,6 +2927,10 @@ export default function App() {
           }
         };
 
+        const uploadLmTimer = window.setInterval(() => {
+          void runUploadLmRefinementPass();
+        }, LIVE_LM_INTERVAL_MS);
+
         try {
           if (waveCount > 0) {
             await Promise.all(
@@ -2361,9 +2940,14 @@ export default function App() {
             );
           }
         } finally {
+          window.clearInterval(uploadLmTimer);
           preWarmedWaves.forEach((wave) =>
             wave.forEach((c) => closeLiveConn(c))
           );
+        }
+
+        if (!fatalError && !abortController.signal.aborted) {
+          await runUploadLmRefinementPass();
         }
 
         setInterimText("");

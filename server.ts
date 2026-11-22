@@ -7,13 +7,16 @@ import {
   AudioTranscriptionConfigMode,
   GoogleGenAI,
   Modality,
+  Type,
   type AudioTranscriptionConfig,
   type LiveServerMessage,
   type Session,
 } from "@google/genai";
+import { FrontierModelRouter } from "./server/modelRouter";
 
 const PORT = 3000;
 const LIVE_TRANSCRIBE_MODEL = "gemini-3.5-transcribe-live";
+const lmRouter = new FrontierModelRouter();
 
 function getAiClient(apiVersion?: string): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -153,7 +156,7 @@ async function startServer(): Promise<void> {
     });
   });
 
-  // Post-transcript synthesis using gemini-4-hydrogen
+  // Post-transcript synthesis using frontier-to-down rate-limit router
   app.post("/api/analyze", async (req, res) => {
     try {
       const { transcript, task } = req.body as {
@@ -177,19 +180,194 @@ async function startServer(): Promise<void> {
       };
 
       const systemInstruction = prompts[task ?? "summary"] ?? prompts.summary;
-      const response = await ai.models.generateContent({
-        model: "gemini-4-hydrogen",
-        contents: transcript,
-        config: {
-          systemInstruction,
-        },
-      });
+      const { result: response } = await lmRouter.executeWithFailover((model) =>
+        ai.models.generateContent({
+          model,
+          contents: transcript,
+          config: {
+            systemInstruction,
+          },
+        })
+      );
 
       res.json({
         result: (response.text ?? "").trim(),
       });
     } catch (err) {
       console.error("Transcript analysis error:", err);
+      res.status(500).json({ error: formatGeminiError(err) });
+    }
+  });
+
+  // Under-the-hood 1-minute multi-worker transcript refinement using frontier-to-down router
+  app.post("/api/refine-transcript", async (req, res) => {
+    try {
+      const {
+        windows,
+        priorContext,
+        languageCode,
+        customVocabulary,
+        scope,
+      } = req.body as {
+        windows?: Array<{
+          windowIndex: number;
+          startMs: number;
+          endMs: number;
+          workers: Record<string, string>;
+        }>;
+        priorContext?: string;
+        languageCode?: string;
+        customVocabulary?: string[];
+        scope?: "live_6w" | "live_5w" | "upload_5w" | "upload_3w";
+      };
+
+      if (!Array.isArray(windows) || windows.length === 0) {
+        res.json({ refinedWindows: [] });
+        return;
+      }
+
+      const isUpload5W = scope === "upload_5w";
+      const isUpload3W = scope === "upload_3w";
+      const boundedWindows = windows.slice(0, 24).map((w) => ({
+        windowIndex: Number(w.windowIndex),
+        startMs: Number(w.startMs),
+        endMs: Number(w.endMs),
+        workers: isUpload5W
+          ? {
+              worker_1_raw_wave_primary: String(w.workers?.worker1LiveRealtime ?? "").trim(),
+              worker_2_raw_wave_contrast: String(w.workers?.worker2FirstHalfPrimary ?? "").trim(),
+              worker_3_hq_wave_verbatim: String(w.workers?.worker3FirstHalfContrast ?? "").trim(),
+              worker_4_hq_wave_smart: String(w.workers?.worker4SecondHalfPrimary ?? "").trim(),
+              worker_5_hq_vocal_clarity: String(w.workers?.worker5SecondHalfContrast ?? "").trim(),
+            }
+          : isUpload3W
+            ? {
+                worker_1_filtered_primary: String(w.workers?.worker2FirstHalfPrimary ?? "").trim(),
+                worker_2_raw_contrast: String(w.workers?.worker3FirstHalfContrast ?? "").trim(),
+                worker_3_focused_backup: String(w.workers?.worker4SecondHalfPrimary ?? "").trim(),
+              }
+            : {
+                worker_1_live_raw_full: String(w.workers?.worker1LiveRealtime ?? "").trim(),
+                worker_2_live_hq_full: String(w.workers?.worker6LiveHqRealtime ?? "").trim(),
+                worker_3_first_half_hq: String(w.workers?.worker2FirstHalfPrimary ?? "").trim(),
+                worker_4_first_half_raw: String(w.workers?.worker3FirstHalfContrast ?? "").trim(),
+                worker_5_second_half_hq: String(w.workers?.worker4SecondHalfPrimary ?? "").trim(),
+                worker_6_second_half_raw: String(w.workers?.worker5SecondHalfContrast ?? "").trim(),
+              },
+      }));
+
+      const ai = getAiClient("v1beta");
+      const cleanVocab = Array.isArray(customVocabulary)
+        ? customVocabulary.map((v) => String(v).trim()).filter(Boolean).slice(0, 120)
+        : [];
+
+      const workerTopologyLine = isUpload5W
+        ? "Each window contains the independent raw outputs of 5 focused ASR workers that all listened to the EXACT SAME full audio segment independently (2 on the raw unmodified audio waveform and 3 on high-quality speech-conditioned waveforms)."
+        : isUpload3W
+          ? "Each window contains the independent raw outputs of 3 parallel ASR workers each listening to the ENTIRE audio chunk independently."
+          : "Each window contains the independent raw outputs of up to 6 ASR workers covering the same 10s live audio window: worker_1 (live raw stream) & worker_2 (live high-quality conditioned stream) cover the full window; worker_3 (HQ) & worker_4 (raw) independently transcribe the first half; worker_5 (HQ) & worker_6 (raw) independently transcribe the second half. Combine first-half and second-half consensus cleanly against both full-window live workers.";
+
+      const systemInstruction = [
+        "You are an under-the-hood multi-worker speech-to-text reconstruction engine.",
+        "You receive a structured JSON batch of time-ordered speech windows.",
+        workerTopologyLine,
+        "",
+        "CORE RECONSTRUCTION RULES:",
+        "1. CONSENSUS WINS ('more workers agreeing beats a single outlier'): Compare all available workers word-by-word and phonetically. Never let an empty or hallucinating single worker override valid words heard by other workers.",
+        "2. CONTEXTUAL & PHONETIC RECOVERY: Real speech ASR workers frequently miss articles/endings, mishear homophones, split/merge words, or stumble on informal conversation, fast English speech, slang, contractions ('gonna', 'wanna', 'kinda', 'don't'), idioms, technical terms, names, numbers, or mixed-language code-switching (including Amharic Ge'ez script + English). Comprehend what the speaker actually meant using cross-worker evidence and priorContext, and reconstruct the exact natural spoken sentence(s).",
+        "3. STRICTLY NO ESSAYS OR INVENTED CONTENT: Never expand, summarize, answer questions, add commentary, add explanations, or generate unstated sentences. Your output for each window MUST strictly represent only the words spoken in that window, matching the natural length and propositions of the worker inputs.",
+        "4. INFORMAL SPEECH FIDELITY: Preserve casual/conversational tone and slang faithfully; only fix garbled ASR mishearings, spacing, punctuation, and casing. Do not turn casual talk into formal essays.",
+        "5. CONTINUITY WITHOUT DUPLICATION: Use priorContext strictly to resolve ambiguous words or grammar across window boundaries. Never repeat sentences from priorContext or duplicate words already finished in an earlier window.",
+        "6. EMPTY / NOISE HANDLING: If all workers for a window are empty or pure noise artifacts, return an empty string \"\" for refinedText.",
+        "7. SCRIPT & LANGUAGE FIDELITY: Respect the language spoken (and languageCode hint when provided). Keep English in clean Latin script and Amharic in Ethiopic (Ge'ez) script; allow natural mixed-language phrases when genuinely spoken.",
+        "8. STRICT OUTPUT FORMAT: Return ONLY valid JSON matching the responseSchema with one entry for every input windowIndex, preserving each exact windowIndex integer.",
+      ].join("\n");
+
+      const payload = {
+        languageHint: languageCode || "auto",
+        customVocabulary: cleanVocab,
+        priorContext:
+          typeof priorContext === "string" ? priorContext.trim().slice(-600) : "",
+        windows: boundedWindows,
+      };
+
+      const { modelUsed, result: response } = await lmRouter.executeWithFailover(
+        (model) =>
+          ai.models.generateContent({
+            model,
+            contents: JSON.stringify(payload),
+            config: {
+              systemInstruction,
+              responseMimeType: "application/json",
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  refinedWindows: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        windowIndex: { type: Type.INTEGER },
+                        refinedText: { type: Type.STRING },
+                        detectedLanguage: { type: Type.STRING },
+                      },
+                      required: ["windowIndex", "refinedText"],
+                    },
+                  },
+                },
+                required: ["refinedWindows"],
+              },
+            },
+          })
+      );
+
+      let parsed: {
+        refinedWindows?: Array<{
+          windowIndex: number;
+          refinedText: string;
+          detectedLanguage?: string;
+        }>;
+      } = {};
+      try {
+        parsed = JSON.parse((response.text ?? "{}").trim()) as typeof parsed;
+      } catch {
+        parsed = {};
+      }
+
+      const byIndex = new Map<
+        number,
+        { windowIndex: number; refinedText: string; detectedLanguage?: string }
+      >();
+      if (Array.isArray(parsed.refinedWindows)) {
+        for (const item of parsed.refinedWindows) {
+          if (typeof item?.windowIndex === "number") {
+            byIndex.set(item.windowIndex, {
+              windowIndex: item.windowIndex,
+              refinedText: String(item.refinedText ?? "").trim(),
+              ...(item.detectedLanguage
+                ? { detectedLanguage: String(item.detectedLanguage).trim() }
+                : {}),
+            });
+          }
+        }
+      }
+
+      const normalized = boundedWindows.map((w) => {
+        const hit = byIndex.get(w.windowIndex);
+        return (
+          hit ?? {
+            windowIndex: w.windowIndex,
+            refinedText: "",
+          }
+        );
+      });
+
+      res.json({
+        refinedWindows: normalized,
+        modelUsed,
+      });
+    } catch (err) {
+      console.error("Structured transcript refinement error:", err);
       res.status(500).json({ error: formatGeminiError(err) });
     }
   });

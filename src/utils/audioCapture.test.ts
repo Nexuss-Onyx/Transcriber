@@ -1,21 +1,45 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  applyVocalPresenceConditioning,
   bcp47ToScriptFamily,
   buildExportContent,
   cleanTranscriptArtifacts,
   countWords,
+  createStreamingSpeechConditioner,
   detectScriptFamily,
   downsampleBuffer,
   float32ToBase64Pcm16,
   formatDuration,
   formatSpeakerDisplay,
   formatSrtTime,
+  normalizeSpeechDynamics,
   reconcileFocusedTranscripts,
   splitTextIntoTimedCues,
   stitchChunkBoundary,
 } from "./audioCapture";
 import type { TranscriptionSession } from "../types/transcribe";
+
+test("speech conditioning helpers boost quiet speech smoothly without clipping peaks", () => {
+  const quietWave = new Float32Array(1600);
+  for (let i = 0; i < quietWave.length; i++) {
+    quietWave[i] = Math.sin((2 * Math.PI * 220 * i) / 16000) * 0.025;
+  }
+  const normalized = normalizeSpeechDynamics(quietWave);
+  const peakNorm = Math.max(...Array.from(normalized, Math.abs));
+  assert.ok(peakNorm > 0.08 && peakNorm <= 0.96);
+
+  const clarified = applyVocalPresenceConditioning(quietWave);
+  assert.equal(clarified.length, quietWave.length);
+  const peakClar = Math.max(...Array.from(clarified, Math.abs));
+  assert.ok(peakClar > 0.05 && peakClar <= 0.96);
+
+  const conditioner = createStreamingSpeechConditioner(16000);
+  const out1 = conditioner(quietWave.subarray(0, 800));
+  const out2 = conditioner(quietWave.subarray(800, 1600));
+  assert.equal(out1.length, 800);
+  assert.equal(out2.length, 800);
+});
 
 test("downsampleBuffer performs 3:1 box decimation from 48kHz to 16kHz", () => {
   const input = new Float32Array([1, 2, 3, 4, 5, 6]);

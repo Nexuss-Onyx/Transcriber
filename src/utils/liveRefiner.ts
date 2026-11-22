@@ -101,14 +101,14 @@ function packetize16kMono(
   const silentPad = float32ToBase64Pcm16(new Float32Array(samplesPerPacket));
   const pkts: string[] = [];
   if (hasSignal) {
-    pkts.push(silentPad, silentPad);
+    pkts.push(silentPad, silentPad, silentPad, silentPad);
   }
   for (let p = 0; p < samples.length; p += samplesPerPacket) {
     const end = Math.min(samples.length, p + samplesPerPacket);
     pkts.push(float32ToBase64Pcm16(samples.subarray(p, end)));
   }
-  if (hasSignal && pkts.length > 2) {
-    pkts.push(silentPad, silentPad);
+  if (hasSignal && pkts.length > 4) {
+    pkts.push(silentPad, silentPad, silentPad, silentPad, silentPad);
   }
   return pkts;
 }
