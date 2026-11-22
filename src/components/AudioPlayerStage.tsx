@@ -132,10 +132,18 @@ export function AudioPlayerStage({
     !chunkProgress?.isPaused;
 
   const isBuffering = Boolean(chunkProgress?.isBuffering);
-  const hasActiveSegment = (chunkProgress?.activeChunkIndices.length ?? 0) > 0;
-  const totalWorkers = chunkProgress?.workerCount ?? 3;
+  const activeIndices = chunkProgress?.activeChunkIndices ?? [];
+  const hasActiveSegment = activeIndices.length > 0;
+  const activeSegLabel = activeIndices.map((i) => i + 1).join(" & ");
+  const totalWaves = chunkProgress?.waveCount ?? (activeIndices.length > 1 ? 2 : 1);
+  const totalWorkers = chunkProgress?.workerCount ?? totalWaves * 3;
   const readyWorkers = chunkProgress?.readyWorkers ?? 0;
   const preRollStage = chunkProgress?.preRollStage ?? "transcribing";
+
+  const activeWorkerSummary =
+    activeIndices.length > 1
+      ? `${totalWaves} waves (${totalWorkers} workers) on segments ${activeSegLabel}`
+      : `3 workers on segment ${activeSegLabel}`;
 
   const statusText = !chunkProgress
     ? ""
@@ -143,21 +151,23 @@ export function AudioPlayerStage({
       ? preRollStage === "segmenting"
         ? "Segmenting audio into 15s clips..."
         : preRollStage === "connecting"
-          ? `Transcribing · Readying workers (${readyWorkers}/${totalWorkers})...`
-          : `Transcribing first segment (${readyWorkers}/${totalWorkers} workers ready)`
+          ? `Transcribing · Readying ${totalWaves} waves (${readyWorkers}/${totalWorkers} workers)...`
+          : totalWaves > 1
+            ? `2 waves focusing on segments 1 & 2 (${readyWorkers}/${totalWorkers} workers ready)`
+            : `Focusing on segment 1 (${readyWorkers}/${totalWorkers} workers ready)`
       : chunkProgress.completedChunks >= chunkProgress.totalChunks &&
           chunkProgress.totalChunks > 0
         ? `${chunkProgress.completedChunks}/${chunkProgress.totalChunks} segments (15s) · Complete`
         : isPlaying
           ? `${chunkProgress.completedChunks}/${chunkProgress.totalChunks} segments (15s) · ${
-              hasActiveSegment
-                ? `${totalWorkers} workers on segment ${chunkProgress.activeChunkIndices[0] + 1}`
-                : "Synced"
+              hasActiveSegment ? activeWorkerSummary : "Synced"
             }`
           : isCompletingAfterEnd
             ? `${chunkProgress.completedChunks}/${chunkProgress.totalChunks} segments (15s) · ${
                 hasActiveSegment
-                  ? `${totalWorkers} workers finishing segment ${chunkProgress.activeChunkIndices[0] + 1}`
+                  ? activeIndices.length > 1
+                    ? `${totalWaves} waves finishing segments ${activeSegLabel}`
+                    : `3 workers finishing segment ${activeSegLabel}`
                   : "Completing..."
               }`
             : `${chunkProgress.completedChunks}/${chunkProgress.totalChunks} segments (15s) · Paused`;
@@ -222,8 +232,10 @@ export function AudioPlayerStage({
                   {preRollStage === "segmenting"
                     ? "Transcribing · Segmenting audio into 15-second clips..."
                     : preRollStage === "connecting"
-                      ? `Transcribing · Preparing ${totalWorkers} Live workers (${readyWorkers}/${totalWorkers} ready)...`
-                      : `Transcribing first 15s segment (${readyWorkers}/${totalWorkers} workers active) · Audio will start automatically when ready...`}
+                      ? `Transcribing · Preparing ${totalWaves} waves (${readyWorkers}/${totalWorkers} Live workers ready)...`
+                      : totalWaves > 1
+                        ? `Transcribing segments 1 & 2 simultaneously (${readyWorkers}/${totalWorkers} workers active) · Playback opens when segment 1 is ready...`
+                        : `Transcribing first 15s segment (${readyWorkers}/${totalWorkers} workers active) · Audio will start automatically when ready...`}
                 </span>
               </div>
             ) : activeSegment ? (

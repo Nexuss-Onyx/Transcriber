@@ -22,6 +22,7 @@ import { AudioPlayerStage } from "./components/AudioPlayerStage";
 import {
   LANGUAGE_OPTIONS,
   type ConnectionState,
+  type LiveRefinementStatus,
   type SessionNotes,
   type TranscriptSegment,
   type TranscriptionConfig,
@@ -31,6 +32,7 @@ import {
 } from "./types/transcribe";
 import {
   AUDIO_WORKLET_SOURCE,
+  bcp47ToScriptFamily,
   buildExportContent,
   cleanTranscriptArtifacts,
   countWords,
@@ -45,14 +47,41 @@ import {
   splitTextIntoTimedCues,
   stitchChunkBoundary,
 } from "./utils/audioCapture";
+import {
+  WORKERS_PER_WAVE,
+  getWaveCount,
+  pickNextWaveSegment,
+  shouldInterruptWaveOnSeek,
+} from "./utils/waveScheduler";
+import {
+  LIVE_SAMPLE_RATE,
+  LIVE_WINDOW_SAMPLES,
+  LIVE_WINDOW_SECONDS,
+  type LiveHalfSlice,
+  type SlicedLiveWindow,
+  appendAndExtractLiveWindows,
+  concatFloat32Arrays,
+  mergeWindowRefinedSegments,
+  sliceLiveWindowIntoHalves,
+} from "./utils/liveRefiner";
 
 const STORAGE_KEY = "transcribe_live_sessions_v1";
 const THEME_KEY = "transcribe_live_theme_v1";
 
+function isFatalConfigErrorMessage(msg: string): boolean {
+  const lower = msg.toLowerCase();
+  return (
+    lower.includes("api_key_invalid") ||
+    lower.includes("invalid gemini_api_key") ||
+    lower.includes("permission denied") ||
+    lower.includes("not configured")
+  );
+}
+
 function createDefaultConfig(): TranscriptionConfig {
   return {
     mode: "VERBATIM",
-    languageCode: "auto",
+    languageCode: "am-ET",
     diarization: false,
     wordTimestamp: false,
     customVocabulary: [],
@@ -174,6 +203,54 @@ export default function App() {
   const accumulatedMsRef = useRef<number>(0);
   const lastSegmentTimeRef = useRef<number>(0);
 
+  // Live 1 + 4 backward refinement worker state & pipeline refs
+  const [liveRefinementStatus, setLiveRefinementStatus] =
+    useState<LiveRefinementStatus | null>(null);
+  const liveRefineAbortRef = useRef<AbortController | null>(null);
+  const liveSessionRunRef = useRef(0);
+  const liveRecordingActiveRef = useRef(false);
+  const livePipelineRef = useRef<{
+    runId: number;
+    chunks: Float32Array[];
+    count: number;
+    windowIndex: number;
+    totalRecordedSamples: number;
+    recordingStartOffsetMs: number;
+    prevTailSamples: Float32Array | null;
+    refiningWindowsCount: number;
+    refinedWindowsCount: number;
+    liveWorkerStatus: "connecting" | "connected" | "reconnecting" | "dropped";
+    lastUiSyncAt: number;
+    rawHalfTexts: Record<number, string>;
+    lockedAutoLang: string | null;
+    lockedScriptFamily: string | null;
+    targetSessionId: string;
+    configSnapshot: TranscriptionConfig;
+    reconnectTimer: number | null;
+    reconnectAttempts: number;
+    isStopping: boolean;
+  }>({
+    runId: 0,
+    chunks: [],
+    count: 0,
+    windowIndex: 0,
+    totalRecordedSamples: 0,
+    recordingStartOffsetMs: 0,
+    prevTailSamples: null,
+    refiningWindowsCount: 0,
+    refinedWindowsCount: 0,
+    liveWorkerStatus: "connecting",
+    lastUiSyncAt: 0,
+    rawHalfTexts: {},
+    lockedAutoLang: null,
+    lockedScriptFamily: null,
+    targetSessionId: "",
+    configSnapshot: createDefaultConfig(),
+    reconnectTimer: null,
+    reconnectAttempts: 0,
+    isStopping: false,
+  });
+
   useEffect(() => {
     activeSessionIdRef.current = activeSessionId;
   }, [activeSessionId]);
@@ -238,6 +315,483 @@ export default function App() {
     []
   );
 
+  const syncLiveRefinementUI = useCallback((force = false) => {
+    const lp = livePipelineRef.current;
+    if (lp.runId !== liveSessionRunRef.current) return;
+    if (!liveRecordingActiveRef.current && lp.refiningWindowsCount === 0) {
+      setLiveRefinementStatus(null);
+      return;
+    }
+    const now = Date.now();
+    if (!force && now - lp.lastUiSyncAt < 180) return;
+    lp.lastUiSyncAt = now;
+    setLiveRefinementStatus({
+      windowIndex: lp.windowIndex,
+      bufferElapsedMs: Math.round((lp.count / LIVE_SAMPLE_RATE) * 1000),
+      bufferDurationMs: LIVE_WINDOW_SECONDS * 1000,
+      refiningWindowsCount: lp.refiningWindowsCount,
+      refinedWindowsCount: lp.refinedWindowsCount,
+      liveWorkerStatus: lp.liveWorkerStatus,
+    });
+  }, []);
+
+  const refineLiveWindow = useCallback(
+    async (
+      sliced: SlicedLiveWindow,
+      runId: number,
+      targetSessionId: string,
+      configSnapshot: TranscriptionConfig,
+      signal: AbortSignal
+    ) => {
+      const lp = livePipelineRef.current;
+      if (lp.runId === runId) {
+        lp.refiningWindowsCount += 1;
+        syncLiveRefinementUI(true);
+      }
+
+      try {
+        if (signal.aborted) return;
+
+        if (!sliced.hasAudioSignal) {
+          updateSessionById(targetSessionId, (s) => ({
+            ...s,
+            segments: mergeWindowRefinedSegments(s.segments, {
+              windowIndex: sliced.windowIndex,
+              windowStartMs: sliced.windowStartMs,
+              windowEndMs: sliced.windowEndMs,
+              refinedSegments: [],
+            }),
+            updatedAt: Date.now(),
+          }));
+          return;
+        }
+
+        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+        const wsEndpoint = `${protocol}//${window.location.host}/ws/transcribe`;
+
+        const runBackwardSinglePass = async (
+          half: LiveHalfSlice,
+          useRaw: boolean,
+          mode: "VERBATIM" | "SMART",
+          intervalMs: number,
+          langHint: string | null,
+          prevSourceText?: string
+        ): Promise<{
+          text: string;
+          lang?: string;
+          isSmart: boolean;
+          fatalError?: string;
+        }> => {
+          const packets = useRaw
+            ? half.rawPacketsBase64
+            : half.pcmPacketsBase64;
+          if (!half.hasAudioSignal || packets.length === 0 || signal.aborted) {
+            return { text: "", isSmart: mode === "SMART" };
+          }
+
+          const executeAttempt = (hint: string | null) =>
+            new Promise<{
+              text: string;
+              lang?: string;
+              isSmart: boolean;
+              passError?: string;
+              fatalError?: string;
+            }>((resolve) => {
+              const ws = new WebSocket(wsEndpoint);
+              const finalParts: string[] = [];
+              let latestInterim = "";
+              let detectedLang: string | undefined;
+              let settled = false;
+              let passError: string | undefined;
+              let idleTimer: number | null = null;
+              let maxTimer: number | null = null;
+
+              const cleanup = () => {
+                if (idleTimer !== null) window.clearTimeout(idleTimer);
+                if (maxTimer !== null) window.clearTimeout(maxTimer);
+                signal.removeEventListener("abort", onAbort);
+                try {
+                  if (ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: "stop" }));
+                  }
+                } catch {
+                  // ignore
+                }
+                setTimeout(() => {
+                  try {
+                    ws.close();
+                  } catch {
+                    // ignore
+                  }
+                }, 120);
+              };
+
+              const finish = () => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                const cleaned = cleanTranscriptArtifacts(
+                  finalParts.length > 0 ? finalParts.join(" ") : latestInterim
+                );
+                resolve({
+                  text: cleaned,
+                  lang: detectedLang,
+                  isSmart: mode === "SMART",
+                  passError,
+                  fatalError:
+                    passError && isFatalConfigErrorMessage(passError)
+                      ? passError
+                      : undefined,
+                });
+              };
+
+              const resetIdle = (ms = 1350) => {
+                if (idleTimer !== null) window.clearTimeout(idleTimer);
+                idleTimer = window.setTimeout(finish, ms);
+              };
+
+              const onAbort = () => finish();
+              signal.addEventListener("abort", onAbort, { once: true });
+
+              ws.onopen = () => {
+                ws.send(
+                  JSON.stringify({
+                    type: "start",
+                    mode,
+                    languageCodes: hint ? [hint] : [],
+                    customVocabulary: configSnapshot.customVocabulary,
+                    ...(mode === "SMART" && prevSourceText
+                      ? { sourceText: prevSourceText }
+                      : {}),
+                  })
+                );
+              };
+
+              ws.onmessage = async (event) => {
+                let msg: {
+                  type: string;
+                  text?: string;
+                  languageCode?: string;
+                  message?: string;
+                };
+                try {
+                  msg = JSON.parse(String(event.data));
+                } catch {
+                  return;
+                }
+
+                if (msg.type === "ready") {
+                  maxTimer = window.setTimeout(
+                    finish,
+                    packets.length * intervalMs + 5500
+                  );
+                  for (let p = 0; p < packets.length; p++) {
+                    if (
+                      settled ||
+                      signal.aborted ||
+                      ws.readyState !== WebSocket.OPEN
+                    ) {
+                      break;
+                    }
+                    ws.send(
+                      JSON.stringify({ type: "audio", data: packets[p] })
+                    );
+                    await new Promise((r) => setTimeout(r, intervalMs));
+                  }
+                  if (
+                    !settled &&
+                    !signal.aborted &&
+                    ws.readyState === WebSocket.OPEN
+                  ) {
+                    ws.send(JSON.stringify({ type: "audioStreamEnd" }));
+                    resetIdle(1350);
+                  } else {
+                    finish();
+                  }
+                  return;
+                }
+
+                if (msg.type === "interim") {
+                  if (msg.text) latestInterim = msg.text;
+                  resetIdle(1350);
+                  return;
+                }
+
+                if (msg.type === "transcript") {
+                  const t = (msg.text ?? "").trim();
+                  if (t) {
+                    finalParts.push(t);
+                    latestInterim = "";
+                  }
+                  if (msg.languageCode) detectedLang = msg.languageCode;
+                  resetIdle(1350);
+                  return;
+                }
+
+                if (msg.type === "turnComplete" || msg.type === "closed") {
+                  finish();
+                  return;
+                }
+
+                if (msg.type === "error") {
+                  passError = msg.message || "Backward worker error.";
+                  finish();
+                }
+              };
+
+              ws.onerror = () => {
+                passError = "Backward worker WebSocket failed.";
+                finish();
+              };
+
+              ws.onclose = () => {
+                finish();
+              };
+            });
+
+          const first = await executeAttempt(langHint);
+          if (first.fatalError || signal.aborted) {
+            return first;
+          }
+          if (!first.text && first.passError) {
+            // 1 automatic resilient retry on transient socket drop
+            const fallbackHint =
+              langHint && configSnapshot.languageCode === "auto"
+                ? null
+                : langHint;
+            return await executeAttempt(fallbackHint);
+          }
+          return first;
+        };
+
+        const activeHalves = sliced.halves.filter((h) => h.hasAudioSignal);
+        if (activeHalves.length === 0) return;
+
+        // 4 independent backward workers run concurrently (2 on first 5s + 2 on later 5s)
+        const contrastMode: "VERBATIM" | "SMART" =
+          configSnapshot.mode === "SMART" ? "VERBATIM" : "SMART";
+
+        const halfPairOutputs = await Promise.all(
+          activeHalves.map(async (half) => {
+            const prevIdx = half.halfIndex - 1;
+            const prevText =
+              prevIdx >= 0 && lp.runId === runId && lp.rawHalfTexts[prevIdx]
+                ? lp.rawHalfTexts[prevIdx].slice(-220)
+                : undefined;
+            const langSnapshot = lp.runId === runId ? lp.lockedAutoLang : null;
+
+            const workers = await Promise.all([
+              // Worker A (Filtered + normalized speech dynamics, configured mode)
+              runBackwardSinglePass(
+                half,
+                false,
+                configSnapshot.mode,
+                102,
+                langSnapshot,
+                prevText
+              ),
+              // Worker B (Raw wideband complement, contrasting mode)
+              runBackwardSinglePass(
+                half,
+                true,
+                contrastMode,
+                106,
+                langSnapshot,
+                prevText
+              ),
+            ]);
+            return { half, workers };
+          })
+        );
+
+        if (signal.aborted) return;
+
+        const fatalRes = halfPairOutputs
+          .flatMap((hp) => hp.workers)
+          .find((w) => w.fatalError);
+        if (fatalRes?.fatalError) {
+          setErrorMessage(fatalRes.fatalError);
+          return;
+        }
+
+        const refinedWindowSegments: TranscriptSegment[] = [];
+        const newLangs: string[] = [];
+
+        for (const { half, workers } of halfPairOutputs) {
+          if (signal.aborted) return;
+
+          const activeScriptLock =
+            lp.runId === runId
+              ? lp.lockedScriptFamily
+              : configSnapshot.languageCode === "auto"
+                ? null
+                : bcp47ToScriptFamily(configSnapshot.languageCode);
+
+          let reconciled = reconcileFocusedTranscripts(
+            workers.map((w) => ({
+              text: w.text,
+              lang: w.lang,
+              isSmart: w.isSmart,
+            })),
+            activeScriptLock
+          );
+
+          const domScript = reconciled.text
+            ? detectScriptFamily(reconciled.text)
+            : null;
+          if (
+            lp.runId === runId &&
+            configSnapshot.languageCode === "auto" &&
+            reconciled.text &&
+            !lp.lockedScriptFamily &&
+            !hasMixedLatinWithNonLatin(reconciled.text)
+          ) {
+            lp.lockedScriptFamily = domScript;
+            lp.lockedAutoLang =
+              reconciled.lang ?? scriptFamilyToBcp47(domScript) ?? null;
+          }
+
+          const effectiveScriptLock =
+            lp.runId === runId ? lp.lockedScriptFamily : activeScriptLock;
+          const effectiveLangLock =
+            lp.runId === runId ? lp.lockedAutoLang : null;
+
+          const driftedOffNonLatin =
+            Boolean(effectiveScriptLock) &&
+            effectiveScriptLock !== "latin" &&
+            Boolean(reconciled.text) &&
+            (hasMixedLatinWithNonLatin(reconciled.text) ||
+              detectScriptFamily(reconciled.text) !== effectiveScriptLock);
+
+          if (effectiveLangLock && reconciled.text && driftedOffNonLatin) {
+            const verifyPass = await runBackwardSinglePass(
+              half,
+              false,
+              configSnapshot.mode,
+              104,
+              effectiveLangLock
+            );
+            if (!signal.aborted && verifyPass.text) {
+              const verifiedRec = reconcileFocusedTranscripts(
+                [
+                  ...workers.map((w) => ({
+                    text: w.text,
+                    lang: w.lang,
+                    isSmart: w.isSmart,
+                  })),
+                  {
+                    text: verifyPass.text,
+                    lang: verifyPass.lang,
+                    isSmart: verifyPass.isSmart,
+                  },
+                ],
+                effectiveScriptLock
+              );
+              if (
+                verifiedRec.text &&
+                detectScriptFamily(verifiedRec.text) === effectiveScriptLock &&
+                !hasMixedLatinWithNonLatin(verifiedRec.text)
+              ) {
+                reconciled = verifiedRec;
+              } else if (
+                detectScriptFamily(verifyPass.text) === effectiveScriptLock &&
+                !hasMixedLatinWithNonLatin(verifyPass.text)
+              ) {
+                reconciled = {
+                  text: verifyPass.text,
+                  lang: verifyPass.lang ?? effectiveLangLock,
+                };
+              }
+            }
+          }
+
+          if (!reconciled.text) continue;
+
+          // Boundary stitch with immediately preceding half/window
+          let prevRaw = "";
+          if (lp.runId === runId) {
+            for (let p = half.halfIndex - 1; p >= 0; p--) {
+              if (lp.rawHalfTexts[p]) {
+                prevRaw = lp.rawHalfTexts[p];
+                break;
+              }
+            }
+          }
+          const stitched = cleanTranscriptArtifacts(
+            prevRaw ? stitchChunkBoundary(prevRaw, reconciled.text) : reconciled.text
+          );
+          if (!stitched) continue;
+
+          if (lp.runId === runId) {
+            lp.rawHalfTexts[half.halfIndex] = stitched;
+          }
+
+          const cues = splitTextIntoTimedCues(
+            stitched,
+            half.startMs,
+            Math.max(half.startMs + 500, half.endMs)
+          );
+          const segLang =
+            reconciled.lang ??
+            effectiveLangLock ??
+            (configSnapshot.languageCode === "auto"
+              ? undefined
+              : configSnapshot.languageCode);
+          if (segLang && !newLangs.includes(segLang)) {
+            newLangs.push(segLang);
+          }
+
+          cues.forEach((cue, cueIdx) => {
+            refinedWindowSegments.push({
+              id: `seg_live_ref_${sliced.windowIndex}_${half.halfIndex}_${cueIdx}_${Date.now()}`,
+              text: cue.text,
+              speakerId: "spk_1",
+              languageCode: segLang,
+              timestampMs: cue.startMs,
+              endTimestampMs: cue.endMs,
+              liveWindowIndex: sliced.windowIndex,
+              liveHalfIndex: half.halfIndex,
+              isProvisional: false,
+              isRefined: true,
+            });
+          });
+        }
+
+        if (signal.aborted) return;
+
+        updateSessionById(targetSessionId, (s) => {
+          let mergedLangs = s.detectedLanguages;
+          for (const nl of newLangs) {
+            if (!mergedLangs.includes(nl)) {
+              mergedLangs = [...mergedLangs, nl];
+            }
+          }
+          return {
+            ...s,
+            segments: mergeWindowRefinedSegments(s.segments, {
+              windowIndex: sliced.windowIndex,
+              windowStartMs: sliced.windowStartMs,
+              windowEndMs: sliced.windowEndMs,
+              refinedSegments: refinedWindowSegments,
+            }),
+            detectedLanguages: mergedLangs,
+            durationMs: Math.max(s.durationMs, sliced.windowEndMs),
+            updatedAt: Date.now(),
+          };
+        });
+      } finally {
+        if (lp.runId === runId) {
+          lp.refiningWindowsCount = Math.max(0, lp.refiningWindowsCount - 1);
+          if (!signal.aborted) {
+            lp.refinedWindowsCount += 1;
+          }
+          syncLiveRefinementUI(true);
+        }
+      }
+    },
+    [syncLiveRefinementUI, updateSessionById]
+  );
+
   const cleanupAudioPipeline = useCallback(() => {
     if (liveTimerRef.current !== null) {
       window.clearInterval(liveTimerRef.current);
@@ -283,12 +837,24 @@ export default function App() {
   }, []);
 
   const stopRecording = useCallback(() => {
-    const targetSessionId = activeSessionIdRef.current;
-    const totalElapsed =
+    const lp = livePipelineRef.current;
+    liveRecordingActiveRef.current = false;
+    lp.isStopping = true;
+
+    if (lp.reconnectTimer !== null) {
+      window.clearTimeout(lp.reconnectTimer);
+      lp.reconnectTimer = null;
+    }
+
+    const targetSessionId = lp.targetSessionId || activeSessionIdRef.current;
+    const totalElapsed = Math.max(
       accumulatedMsRef.current +
-      (!isPausedRef.current && runStartRef.current > 0
-        ? Date.now() - runStartRef.current
-        : 0);
+        (!isPausedRef.current && runStartRef.current > 0
+          ? Date.now() - runStartRef.current
+          : 0),
+      lp.recordingStartOffsetMs +
+        Math.round((lp.totalRecordedSamples / LIVE_SAMPLE_RATE) * 1000)
+    );
 
     updateSessionById(targetSessionId, (s) => ({
       ...s,
@@ -324,16 +890,55 @@ export default function App() {
     }
 
     cleanupAudioPipeline();
+
+    // Flush any remaining recorded partial window (>= 0.4s) to backward workers on Stop
+    const leftoverCount = lp.count;
+    const minTailSamples = Math.floor(LIVE_SAMPLE_RATE * 0.4);
+    if (
+      leftoverCount >= minTailSamples &&
+      liveRefineAbortRef.current &&
+      !liveRefineAbortRef.current.signal.aborted
+    ) {
+      const leftoverSamples = concatFloat32Arrays(lp.chunks);
+      lp.chunks = [];
+      lp.count = 0;
+      const tailWinIdx = lp.windowIndex;
+      const tailWinStartMs =
+        lp.recordingStartOffsetMs + tailWinIdx * LIVE_WINDOW_SECONDS * 1000;
+      lp.windowIndex = tailWinIdx + 1;
+
+      const slicedTail = sliceLiveWindowIntoHalves({
+        windowSamples: leftoverSamples,
+        prevTailSamples: lp.prevTailSamples,
+        windowIndex: tailWinIdx,
+        windowStartMs: tailWinStartMs,
+      });
+      lp.prevTailSamples = slicedTail.tailSamples;
+      void refineLiveWindow(
+        slicedTail,
+        lp.runId,
+        targetSessionId,
+        lp.configSnapshot,
+        liveRefineAbortRef.current.signal
+      );
+    } else {
+      lp.chunks = [];
+      lp.count = 0;
+    }
+
     setInterimText("");
     setInterimSpeaker("");
     setInterimLanguage("");
     setConnectionState("idle");
-  }, [cleanupAudioPipeline, updateSessionById]);
+    syncLiveRefinementUI(true);
+  }, [cleanupAudioPipeline, refineLiveWindow, syncLiveRefinementUI, updateSessionById]);
 
   useEffect(() => {
     return () => {
+      liveRecordingActiveRef.current = false;
       cleanupAudioPipeline();
       uploadAbortRef.current?.abort();
+      liveRefineAbortRef.current?.abort();
       if (wsRef.current) {
         try {
           wsRef.current.close();
@@ -380,8 +985,49 @@ export default function App() {
 
     const currentSess = activeSession;
     const targetSessionId = currentSess.id;
+    const cfgSnapshot: TranscriptionConfig = {
+      ...currentSess.config,
+      customVocabulary: [...currentSess.config.customVocabulary],
+    };
     accumulatedMsRef.current = currentSess.durationMs;
     setLiveDurationMs(currentSess.durationMs);
+
+    liveRefineAbortRef.current?.abort();
+    const refineController = new AbortController();
+    liveRefineAbortRef.current = refineController;
+    const runId = ++liveSessionRunRef.current;
+
+    if (livePipelineRef.current.reconnectTimer !== null) {
+      window.clearTimeout(livePipelineRef.current.reconnectTimer);
+    }
+
+    livePipelineRef.current = {
+      runId,
+      chunks: [],
+      count: 0,
+      windowIndex: 0,
+      totalRecordedSamples: 0,
+      recordingStartOffsetMs: currentSess.durationMs,
+      prevTailSamples: null,
+      refiningWindowsCount: 0,
+      refinedWindowsCount: 0,
+      liveWorkerStatus: "connecting",
+      lastUiSyncAt: 0,
+      rawHalfTexts: {},
+      lockedAutoLang:
+        cfgSnapshot.languageCode === "auto" ? null : cfgSnapshot.languageCode,
+      lockedScriptFamily:
+        cfgSnapshot.languageCode === "auto"
+          ? null
+          : bcp47ToScriptFamily(cfgSnapshot.languageCode),
+      targetSessionId,
+      configSnapshot: cfgSnapshot,
+      reconnectTimer: null,
+      reconnectAttempts: 0,
+      isStopping: false,
+    };
+    liveRecordingActiveRef.current = true;
+    syncLiveRefinementUI(true);
 
     try {
       if (!navigator.mediaDevices?.getUserMedia) {
@@ -402,7 +1048,7 @@ export default function App() {
       streamRef.current = stream;
       void refreshAudioDevices();
 
-      const audioCtx = new AudioContext({ sampleRate: 16000 });
+      const audioCtx = new AudioContext({ sampleRate: LIVE_SAMPLE_RATE });
       audioCtxRef.current = audioCtx;
       if (audioCtx.state === "suspended") {
         await audioCtx.resume();
@@ -422,40 +1068,155 @@ export default function App() {
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
       const wsEndpoint = `${protocol}//${window.location.host}/ws/transcribe`;
       let rotatingSocket = false;
+      let micStartedListening = false;
+
+      const ensureMicListeningState = () => {
+        if (
+          micStartedListening ||
+          !liveRecordingActiveRef.current ||
+          livePipelineRef.current.runId !== runId ||
+          livePipelineRef.current.isStopping
+        ) {
+          return;
+        }
+        micStartedListening = true;
+        setConnectionState("listening");
+        if (runStartRef.current === 0) {
+          runStartRef.current = Date.now();
+        }
+        if (liveTimerRef.current === null) {
+          liveTimerRef.current = window.setInterval(() => {
+            if (!isPausedRef.current && runStartRef.current > 0) {
+              const elapsed =
+                accumulatedMsRef.current + (Date.now() - runStartRef.current);
+              setLiveDurationMs(elapsed);
+            }
+          }, 250);
+        }
+      };
 
       const sendPcmChunk = (float32: Float32Array) => {
         if (isPausedRef.current) return;
-        const activeWs = wsRef.current;
-        if (!activeWs || activeWs.readyState !== WebSocket.OPEN) return;
+        const lp = livePipelineRef.current;
+        if (!liveRecordingActiveRef.current || lp.runId !== runId) return;
+
+        ensureMicListeningState();
+
         const downsampled = downsampleBuffer(
           float32,
           audioCtx.sampleRate,
-          16000
+          LIVE_SAMPLE_RATE
         );
-        const base64 = float32ToBase64Pcm16(downsampled);
-        activeWs.send(JSON.stringify({ type: "audio", data: base64 }));
+
+        // 1) Forward raw live audio frame to the Live Voice Worker if open
+        const activeWs = wsRef.current;
+        if (activeWs && activeWs.readyState === WebSocket.OPEN) {
+          const base64 = float32ToBase64Pcm16(downsampled);
+          activeWs.send(JSON.stringify({ type: "audio", data: base64 }));
+        }
+
+        // 2) Buffer into the rolling 10-second live window; once 10s is reached,
+        //    drop the consumed 10s buffer, start recording the next 10s window,
+        //    and fire the 4 independent backward workers (2+2 on first 5s + later 5s)
+        lp.totalRecordedSamples += downsampled.length;
+        const extracted = appendAndExtractLiveWindows(
+          lp.chunks,
+          lp.count,
+          downsampled,
+          LIVE_WINDOW_SAMPLES
+        );
+        lp.chunks = extracted.remainingChunks;
+        lp.count = extracted.remainingCount;
+
+        for (const completedWindowSamples of extracted.completedWindows) {
+          const winIdx = lp.windowIndex;
+          const winStartMs =
+            lp.recordingStartOffsetMs + winIdx * LIVE_WINDOW_SECONDS * 1000;
+          lp.windowIndex = winIdx + 1;
+
+          const sliced = sliceLiveWindowIntoHalves({
+            windowSamples: completedWindowSamples,
+            prevTailSamples: lp.prevTailSamples,
+            windowIndex: winIdx,
+            windowStartMs: winStartMs,
+          });
+          lp.prevTailSamples = sliced.tailSamples;
+
+          void refineLiveWindow(
+            sliced,
+            runId,
+            targetSessionId,
+            cfgSnapshot,
+            refineController.signal
+          );
+        }
+
+        syncLiveRefinementUI(extracted.completedWindows.length > 0);
       };
 
       const attachMicSocket = (isReplacement: boolean) => {
+        const lp = livePipelineRef.current;
+        if (
+          !liveRecordingActiveRef.current ||
+          lp.runId !== runId ||
+          lp.isStopping
+        ) {
+          return;
+        }
+
         const ws = new WebSocket(wsEndpoint);
-        if (!isReplacement) {
+        if (!isReplacement || !wsRef.current) {
           wsRef.current = ws;
         }
 
+        const handleNonFatalLiveDrop = () => {
+          if (
+            !liveRecordingActiveRef.current ||
+            lp.runId !== runId ||
+            lp.isStopping
+          ) {
+            return;
+          }
+          ensureMicListeningState();
+          if (wsRef.current === ws) {
+            wsRef.current = null;
+          }
+          setInterimText("");
+
+          // Resiliency rule: if live worker drops, never abort mic capture or 4 backward workers!
+          if (lp.reconnectAttempts < 3) {
+            lp.reconnectAttempts += 1;
+            lp.liveWorkerStatus = "reconnecting";
+            syncLiveRefinementUI(true);
+            if (lp.reconnectTimer !== null) {
+              window.clearTimeout(lp.reconnectTimer);
+            }
+            lp.reconnectTimer = window.setTimeout(() => {
+              lp.reconnectTimer = null;
+              attachMicSocket(true);
+            }, 900 * lp.reconnectAttempts);
+          } else {
+            lp.liveWorkerStatus = "dropped";
+            syncLiveRefinementUI(true);
+          }
+        };
+
         ws.onopen = () => {
-          const cfg = currentSess.config;
           ws.send(
             JSON.stringify({
               type: "start",
-              mode: cfg.mode,
+              mode: cfgSnapshot.mode,
               languageCodes:
-                cfg.languageCode === "auto" ? [] : [cfg.languageCode],
-              customVocabulary: cfg.customVocabulary,
+                cfgSnapshot.languageCode === "auto"
+                  ? []
+                  : [cfgSnapshot.languageCode],
+              customVocabulary: cfgSnapshot.customVocabulary,
             })
           );
         };
 
         ws.onmessage = (event) => {
+          if (lp.runId !== runId || lp.isStopping) return;
           let msg: {
             type: string;
             text?: string;
@@ -473,10 +1234,13 @@ export default function App() {
           }
 
           if (msg.type === "ready") {
+            lp.liveWorkerStatus = "connected";
+            lp.reconnectAttempts = 0;
             if (isReplacement) {
               const previousWs = wsRef.current;
               wsRef.current = ws;
               rotatingSocket = false;
+              syncLiveRefinementUI(true);
               if (previousWs && previousWs !== ws) {
                 try {
                   if (previousWs.readyState === WebSocket.OPEN) {
@@ -496,22 +1260,16 @@ export default function App() {
               return;
             }
 
-            setConnectionState("listening");
-            runStartRef.current = Date.now();
-            if (liveTimerRef.current === null) {
-              liveTimerRef.current = window.setInterval(() => {
-                if (!isPausedRef.current && runStartRef.current > 0) {
-                  const elapsed =
-                    accumulatedMsRef.current +
-                    (Date.now() - runStartRef.current);
-                  setLiveDurationMs(elapsed);
-                }
-              }, 250);
-            }
+            ensureMicListeningState();
+            syncLiveRefinementUI(true);
             return;
           }
 
-          if (msg.type === "goAway" && !rotatingSocket && wsRef.current === ws) {
+          if (
+            msg.type === "goAway" &&
+            !rotatingSocket &&
+            wsRef.current === ws
+          ) {
             rotatingSocket = true;
             attachMicSocket(true);
             return;
@@ -530,20 +1288,33 @@ export default function App() {
             if (!cleanText) return;
 
             const currentElapsed =
-              accumulatedMsRef.current +
-              (!isPausedRef.current && runStartRef.current > 0
-                ? Date.now() - runStartRef.current
-                : 0);
+              lp.recordingStartOffsetMs +
+              Math.round((lp.totalRecordedSamples / LIVE_SAMPLE_RATE) * 1000);
+            const liveWinIdx = Math.floor(
+              lp.totalRecordedSamples / LIVE_WINDOW_SAMPLES
+            );
 
             const speakerId = msg.speakerLabel || "spk_1";
             const lang = msg.languageCode;
             const now = Date.now();
 
             updateSessionById(targetSessionId, (s) => {
+              // If the 4 backward workers already refined this window, don't inject stale drafts
+              const windowAlreadyRefined = s.segments.some(
+                (seg) =>
+                  seg.liveWindowIndex === liveWinIdx && Boolean(seg.isRefined)
+              );
+              if (windowAlreadyRefined) {
+                return s;
+              }
+
               const lastSeg = s.segments[s.segments.length - 1];
               const shouldMerge =
                 lastSeg &&
+                lastSeg.isProvisional &&
+                !lastSeg.isRefined &&
                 !lastSeg.isEdited &&
+                lastSeg.liveWindowIndex === liveWinIdx &&
                 lastSeg.speakerId === speakerId &&
                 now - lastSegmentTimeRef.current < 2400 &&
                 !/[.!?።፧。？！]$/.test(lastSeg.text.trim()) &&
@@ -578,6 +1349,8 @@ export default function App() {
                 speakerId,
                 languageCode: lang,
                 timestampMs: currentElapsed,
+                liveWindowIndex: liveWinIdx,
+                isProvisional: true,
                 startOffset: msg.startOffset,
                 words: msg.words,
               };
@@ -596,30 +1369,38 @@ export default function App() {
           }
 
           if (msg.type === "error") {
-            if (isReplacement && wsRef.current !== ws) {
-              rotatingSocket = false;
+            const errMsg = msg.message || "Transcription connection error.";
+            if (isFatalConfigErrorMessage(errMsg)) {
+              liveRecordingActiveRef.current = false;
+              lp.isStopping = true;
+              refineController.abort();
+              setErrorMessage(errMsg);
+              cleanupAudioPipeline();
+              setConnectionState("error");
+              syncLiveRefinementUI(true);
+              if (wsRef.current) {
+                try {
+                  wsRef.current.close();
+                } catch {
+                  // ignore
+                }
+                wsRef.current = null;
+              }
               return;
             }
-            setErrorMessage(msg.message || "Transcription connection error.");
-            cleanupAudioPipeline();
-            setConnectionState("error");
-            if (wsRef.current) {
-              try {
-                wsRef.current.close();
-              } catch {
-                // ignore
-              }
-              wsRef.current = null;
+            if (isReplacement && wsRef.current !== ws) {
+              rotatingSocket = false;
             }
+            handleNonFatalLiveDrop();
             return;
           }
 
           if (msg.type === "closed") {
-            if (wsRef.current === ws) {
-              cleanupAudioPipeline();
-              wsRef.current = null;
-              setConnectionState("idle");
+            if (isReplacement && wsRef.current !== ws) {
+              rotatingSocket = false;
+              return;
             }
+            handleNonFatalLiveDrop();
           }
         };
 
@@ -628,11 +1409,15 @@ export default function App() {
             rotatingSocket = false;
             return;
           }
-          setErrorMessage(
-            "WebSocket connection failed. Please ensure the server is running."
-          );
-          cleanupAudioPipeline();
-          setConnectionState("error");
+          handleNonFatalLiveDrop();
+        };
+
+        ws.onclose = () => {
+          if (isReplacement && wsRef.current !== ws) {
+            rotatingSocket = false;
+            return;
+          }
+          handleNonFatalLiveDrop();
         };
       };
 
@@ -674,6 +1459,9 @@ export default function App() {
         scriptNodeRef.current = scriptNode;
       }
     } catch (err) {
+      liveRecordingActiveRef.current = false;
+      livePipelineRef.current.isStopping = true;
+      refineController.abort();
       const msg =
         err instanceof Error
           ? err.name === "NotAllowedError"
@@ -683,13 +1471,16 @@ export default function App() {
       setErrorMessage(msg);
       cleanupAudioPipeline();
       setConnectionState("idle");
+      syncLiveRefinementUI(true);
     }
   }, [
     activeSession,
     cleanupAudioPipeline,
     connectionState,
+    refineLiveWindow,
     refreshAudioDevices,
     selectedDeviceId,
+    syncLiveRefinementUI,
     updateSessionById,
   ]);
 
@@ -746,7 +1537,8 @@ export default function App() {
           completedChunks: 0,
           completedChunkIndices: [],
           activeChunkIndices: [],
-          workerCount: 3,
+          waveCount: 2,
+          workerCount: 6,
           readyWorkers: 0,
           preRollStage: "segmenting",
           isBuffering: true,
@@ -774,7 +1566,8 @@ export default function App() {
             : prev
         );
 
-        const workerCount = chunks.length > 0 ? 3 : 0;
+        const waveCount = getWaveCount(chunks.length);
+        const workerCount = waveCount * WORKERS_PER_WAVE;
         isPreBufferingRef.current = chunks.length > 0;
         let preRollCompleted = chunks.length === 0;
         let readyWorkerCount = 0;
@@ -787,6 +1580,7 @@ export default function App() {
           completedChunks: 0,
           completedChunkIndices: [],
           activeChunkIndices: [],
+          waveCount,
           workerCount,
           readyWorkers: 0,
           preRollStage,
@@ -799,7 +1593,10 @@ export default function App() {
 
         let lockedAutoLang: string | null =
           cfg.languageCode === "auto" ? null : cfg.languageCode;
-        let lockedScriptFamily: string | null = null;
+        let lockedScriptFamily: string | null =
+          cfg.languageCode === "auto"
+            ? null
+            : bcp47ToScriptFamily(cfg.languageCode);
 
         // Isolated Live WebSocket session helper (1 independent session per pass)
         const openLiveWs = (
@@ -1042,6 +1839,7 @@ export default function App() {
             activeChunkIndices: pausedNow
               ? []
               : Array.from(activeChunksSet).sort((a, b) => a - b),
+            waveCount,
             workerCount,
             readyWorkers: readyWorkerCount,
             preRollStage,
@@ -1083,37 +1881,18 @@ export default function App() {
           }
         };
 
-        /**
-         * Strictly focuses on the current 15s segment (or at most 1 immediate next segment
-         * while playing current audio) instead of jumping ahead across distant segments.
-         */
-        const pickFocusedSegment = (): number | null => {
-          if (isPreBufferingRef.current) {
-            return completedSet.has(0) ? null : 0;
-          }
-          if (isAudioPlayingRef.current) {
-            const currentSec = audioElRef.current?.currentTime ?? 0;
-            const playheadIdx = findChunkAtSec(currentSec);
-            if (!completedSet.has(playheadIdx)) {
-              return playheadIdx;
-            }
-            if (
-              playheadIdx + 1 < chunks.length &&
-              !completedSet.has(playheadIdx + 1)
-            ) {
-              return playheadIdx + 1;
-            }
-            return null;
-          }
-          if (audioPlaybackEndedRef.current) {
-            for (let i = 0; i < chunks.length; i++) {
-              if (!completedSet.has(i)) {
-                return i;
-              }
-            }
-          }
-          return null;
-        };
+        const pickFocusedSegment = (): number | null =>
+          pickNextWaveSegment({
+            totalChunks: chunks.length,
+            completed: completedSet,
+            active: activeChunksSet,
+            isPreBuffering: isPreBufferingRef.current,
+            isPlaying: isAudioPlayingRef.current,
+            isAudioEnded: audioPlaybackEndedRef.current,
+            playheadChunkIdx: findChunkAtSec(
+              audioElRef.current?.currentTime ?? 0
+            ),
+          });
 
         const isFatalConfigError = (msg: string) => {
           const lower = msg.toLowerCase();
@@ -1125,24 +1904,34 @@ export default function App() {
           );
         };
 
-        // Pre-warm all 3 workers concurrently so all Live sessions are ready before transcribing
-        let preWarmedConns: Array<Awaited<ReturnType<typeof openLiveWs>> | null> =
-          [];
-        if (workerCount > 0) {
-          preWarmedConns = await Promise.all(
-            Array.from({ length: workerCount }, async (_, idx) => {
-              const modeForPass =
-                idx === 2 ? "SMART" : cfg.mode;
-              const conn = await openLiveWs(lockedAutoLang, undefined, modeForPass);
-              readyWorkerCount += 1;
-              syncProgressUI();
-              return conn;
-            })
+        // Pre-warm up to 2 waves (3 workers per wave = 6 workers) concurrently before transcribing
+        let preWarmedWaves: Array<
+          Array<Awaited<ReturnType<typeof openLiveWs>> | null>
+        > = [];
+        if (waveCount > 0) {
+          preWarmedWaves = await Promise.all(
+            Array.from({ length: waveCount }, () =>
+              Promise.all(
+                Array.from({ length: WORKERS_PER_WAVE }, async (_, idx) => {
+                  const modeForPass = idx === 2 ? "SMART" : cfg.mode;
+                  const conn = await openLiveWs(
+                    lockedAutoLang,
+                    undefined,
+                    modeForPass
+                  );
+                  readyWorkerCount += 1;
+                  syncProgressUI();
+                  return conn;
+                })
+              )
+            )
           );
         }
 
         if (abortController.signal.aborted) {
-          preWarmedConns.forEach((c) => closeLiveConn(c));
+          preWarmedWaves.forEach((wave) =>
+            wave.forEach((c) => closeLiveConn(c))
+          );
           return;
         }
 
@@ -1281,7 +2070,9 @@ export default function App() {
                 const seekedChunk = findChunkAtSec(
                   audioElRef.current?.currentTime ?? 0
                 );
-                if (!completedSet.has(seekedChunk) && seekedChunk !== targetIdx) {
+                if (
+                  shouldInterruptWaveOnSeek(targetIdx, seekedChunk, completedSet)
+                ) {
                   interruptedByControl = true;
                   break;
                 }
@@ -1362,7 +2153,7 @@ export default function App() {
           };
         };
 
-        try {
+        const runWaveLoop = async (waveId: number) => {
           while (
             !abortController.signal.aborted &&
             !fatalError &&
@@ -1374,8 +2165,10 @@ export default function App() {
               audioPlaybackEndedRef.current;
 
             if (!shouldRun) {
-              setInterimText("");
-              syncProgressUI();
+              if (waveId === 0) {
+                setInterimText("");
+                syncProgressUI();
+              }
               await new Promise((r) => setTimeout(r, 150));
               continue;
             }
@@ -1387,7 +2180,6 @@ export default function App() {
             }
 
             const chunk = chunks[targetIdx];
-            activeChunksSet.clear();
             activeChunksSet.add(targetIdx);
             syncProgressUI();
 
@@ -1399,10 +2191,11 @@ export default function App() {
               continue;
             }
 
-            // Use pre-warmed connections for Segment 0 on the very first run
+            // Use this wave's 3 pre-warmed connections on its very first segment
+            const wavePreConns = preWarmedWaves[waveId] ?? [];
             const passPreConns = PASS_SPECS.map((_, idx) => {
-              const c = preWarmedConns[idx] ?? null;
-              preWarmedConns[idx] = null;
+              const c = wavePreConns[idx] ?? null;
+              wavePreConns[idx] = null;
               return c;
             });
 
@@ -1418,7 +2211,12 @@ export default function App() {
               break;
             }
 
-            setInterimText("");
+            if (
+              !isAudioPlayingRef.current ||
+              findChunkAtSec(audioElRef.current?.currentTime ?? 0) === targetIdx
+            ) {
+              setInterimText("");
+            }
 
             const fatal = results.find(
               (r) => r.passError && isFatalConfigError(r.passError)
@@ -1456,23 +2254,33 @@ export default function App() {
               cfg.languageCode === "auto" &&
               reconciled.text &&
               !lockedScriptFamily &&
-              (targetIdx <= 1 || completedSet.size === 0)
+              (targetIdx === 0 ||
+                (targetIdx === 1 && !hasMixedLatinWithNonLatin(reconciled.text)) ||
+                completedSet.size === 0)
             ) {
               lockedScriptFamily = domScript;
               lockedAutoLang =
                 reconciled.lang ?? scriptFamilyToBcp47(domScript) ?? null;
             }
 
-            // If Segment 0 mixed Latin + non-Latin (e.g. English intro inside Amharic), run 1 focused locked-lang verification pass before playback opens!
+            // If locked to a non-Latin language (e.g. Amharic am-ET) and this segment drifted to Latin or mixed Latin, run 1 focused locked-lang verification pass!
+            const driftedOffNonLatin =
+              Boolean(lockedScriptFamily) &&
+              lockedScriptFamily !== "latin" &&
+              Boolean(reconciled.text) &&
+              (hasMixedLatinWithNonLatin(reconciled.text) ||
+                detectScriptFamily(reconciled.text) !== lockedScriptFamily);
+
             if (
-              targetIdx === 0 &&
-              cfg.languageCode === "auto" &&
               lockedAutoLang &&
               reconciled.text &&
-              hasMixedLatinWithNonLatin(reconciled.text)
+              (driftedOffNonLatin ||
+                (targetIdx === 0 &&
+                  cfg.languageCode === "auto" &&
+                  hasMixedLatinWithNonLatin(reconciled.text)))
             ) {
               const verified = await runSinglePassOnSegment(
-                0,
+                targetIdx,
                 { passId: 0, useRaw: false, mode: cfg.mode, intervalMs: 115 },
                 null,
                 lockedAutoLang
@@ -1534,8 +2342,20 @@ export default function App() {
             await maybeStartAutoPlayback();
             syncProgressUI();
           }
+        };
+
+        try {
+          if (waveCount > 0) {
+            await Promise.all(
+              Array.from({ length: waveCount }, (_, waveId) =>
+                runWaveLoop(waveId)
+              )
+            );
+          }
         } finally {
-          preWarmedConns.forEach((c) => closeLiveConn(c));
+          preWarmedWaves.forEach((wave) =>
+            wave.forEach((c) => closeLiveConn(c))
+          );
         }
 
         setInterimText("");
@@ -1663,6 +2483,9 @@ export default function App() {
   ]);
 
   const handleNewSession = () => {
+    if (isActiveLive) {
+      stopRecording();
+    }
     detachUploadedAudio();
     const fresh = createEmptySession(activeSession.config);
     setSessions((prev) => [fresh, ...prev]);
@@ -1673,6 +2496,14 @@ export default function App() {
   };
 
   const handleDeleteSession = (id: string) => {
+    if (livePipelineRef.current.targetSessionId === id) {
+      if (isActiveLive) {
+        stopRecording();
+      }
+      liveRefineAbortRef.current?.abort();
+      livePipelineRef.current.refiningWindowsCount = 0;
+      setLiveRefinementStatus(null);
+    }
     if (uploadedAudio?.sessionId === id) {
       detachUploadedAudio();
     }
@@ -2091,6 +2922,11 @@ export default function App() {
             interimSpeaker={interimSpeaker}
             interimLanguage={interimLanguage}
             connectionState={connectionState}
+            liveRefinementStatus={
+              livePipelineRef.current.targetSessionId === activeSession.id
+                ? liveRefinementStatus
+                : null
+            }
             searchQuery={searchQuery}
             hasAudioPlayer={hasPlayerForActiveSession}
             playbackTimeMs={playbackTimeMs}
@@ -2109,7 +2945,32 @@ export default function App() {
         )}
 
         {/* Bottom Acoustic Transport Dock */}
-        <footer className="shrink-0 border-t border-slate-200 bg-white px-4 py-3 dark:border-slate-800 dark:bg-slate-900 sm:px-6">
+        <footer className="relative shrink-0 border-t border-slate-200 bg-white px-4 py-3 dark:border-slate-800 dark:bg-slate-900 sm:px-6">
+          {!hasPlayerForActiveSession && liveRefinementStatus && (
+            <div
+              className="absolute inset-x-0 top-0 h-0.5 bg-slate-100 dark:bg-slate-800"
+              aria-hidden="true"
+            >
+              <div
+                className={`h-full transition-all duration-200 ${
+                  liveRefinementStatus.refiningWindowsCount > 0
+                    ? "bg-emerald-500"
+                    : "bg-rose-500"
+                }`}
+                style={{
+                  width: `${Math.min(
+                    100,
+                    Math.max(
+                      0,
+                      (liveRefinementStatus.bufferElapsedMs /
+                        Math.max(1, liveRefinementStatus.bufferDurationMs)) *
+                        100
+                    )
+                  )}%`,
+                }}
+              />
+            </div>
+          )}
           {hasPlayerForActiveSession ? (
             <div className="mx-auto flex max-w-3xl items-center justify-between gap-4">
               <div className="flex items-center gap-2 text-xs font-medium whitespace-nowrap shrink-0">
@@ -2154,8 +3015,10 @@ export default function App() {
                     ? chunkProgress.preRollStage === "segmenting"
                       ? "Segmenting audio into 15s clips..."
                       : chunkProgress.preRollStage === "connecting"
-                        ? `Readying ${chunkProgress.readyWorkers ?? 0}/${chunkProgress.workerCount ?? 5} Live workers...`
-                        : `Finishing segment 1 (${chunkProgress.readyWorkers ?? 0}/${chunkProgress.workerCount ?? 5} workers ready)`
+                        ? `Readying ${chunkProgress.waveCount ?? 2} waves (${chunkProgress.readyWorkers ?? 0}/${chunkProgress.workerCount ?? 6} workers)...`
+                        : (chunkProgress.waveCount ?? 1) > 1
+                          ? `Focusing on segments 1 & 2 (${chunkProgress.readyWorkers ?? 0}/${chunkProgress.workerCount ?? 6} workers ready)`
+                          : `Finishing segment 1 (${chunkProgress.readyWorkers ?? 0}/${chunkProgress.workerCount ?? 3} workers ready)`
                     : chunkProgress.totalChunks > 0
                       ? `${chunkProgress.completedChunks}/${chunkProgress.totalChunks} segments (15s)`
                       : "Slicing 15s segments..."
@@ -2202,14 +3065,19 @@ export default function App() {
             </div>
           ) : (
             <div className="mx-auto flex max-w-3xl items-center justify-between gap-4">
-              {/* Left: Status & Device selector */}
+              {/* Left: Status, 1+4 Backward Progress, & Device selector */}
               <div className="flex min-w-0 items-center gap-3">
                 <div className="flex items-center gap-2 text-xs font-medium whitespace-nowrap shrink-0">
                   {connectionState === "listening" && (
                     <>
                       <span className="h-2 w-2 rounded-full bg-rose-600 animate-pulse" />
                       <span className="text-rose-600 dark:text-rose-400">
-                        Recording
+                        {liveRefinementStatus?.liveWorkerStatus === "dropped"
+                          ? "4 Backward Active"
+                          : liveRefinementStatus?.liveWorkerStatus ===
+                              "reconnecting"
+                            ? "Live Reconnecting"
+                            : "Recording"}
                       </span>
                     </>
                   )}
@@ -2225,14 +3093,30 @@ export default function App() {
                   )}
                   {(connectionState === "idle" ||
                     connectionState === "stopping" ||
-                    connectionState === "error") && (
-                    <span className="text-slate-500 dark:text-slate-400">
-                      Standby
-                    </span>
-                  )}
+                    connectionState === "error") &&
+                    (liveRefinementStatus &&
+                    liveRefinementStatus.refiningWindowsCount > 0 ? (
+                      <span className="text-emerald-600 dark:text-emerald-400">
+                        Refining final pass...
+                      </span>
+                    ) : (
+                      <span className="text-slate-500 dark:text-slate-400">
+                        Standby
+                      </span>
+                    ))}
                 </div>
 
-                {audioDevices.length > 0 && (
+                {liveRefinementStatus && (
+                  <span className="hidden text-[11px] font-mono tabular-nums text-slate-500 dark:text-slate-400 md:inline truncate">
+                    {liveRefinementStatus.refiningWindowsCount > 0
+                      ? `10s #${liveRefinementStatus.windowIndex + 1} · 4 backward refining (${liveRefinementStatus.refiningWindowsCount})`
+                      : `10s buffer ${(
+                          liveRefinementStatus.bufferElapsedMs / 1000
+                        ).toFixed(1)}s/10s · ${liveRefinementStatus.refinedWindowsCount} refined`}
+                  </span>
+                )}
+
+                {audioDevices.length > 0 && !liveRefinementStatus && (
                   <select
                     aria-label="Microphone input device"
                     disabled={isActiveLive}

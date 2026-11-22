@@ -169,11 +169,11 @@ async function startServer(): Promise<void> {
       const ai = getAiClient("v1beta");
       const prompts: Record<string, string> = {
         summary:
-          "Summarize the following transcript into a concise executive overview followed by 3–6 clear key takeaways. Use clean markdown headings and bullet points. Do not invent facts not present in the transcript.",
+          "Summarize the following transcript into a concise executive overview followed by 3–6 clear key takeaways. Use clean markdown headings and bullet points. Write in the same language and script as the transcript (e.g., respond in Amharic using Ethiopic script if the transcript is in Amharic). Do not invent facts not present in the transcript.",
         actions:
-          "Extract all action items, decisions, owners (if mentioned), and follow-up questions from this transcript. Format as clean markdown bullet points. If none are explicit, note the main open questions or next steps.",
+          "Extract all action items, decisions, owners (if mentioned), and follow-up questions from this transcript. Format as clean markdown bullet points. Write in the same language and script as the transcript (e.g., respond in Amharic using Ethiopic script if the transcript is in Amharic). If none are explicit, note the main open questions or next steps.",
         polish:
-          "Lightly edit this raw speech transcript for readability: fix punctuation, remove verbal filler words, and organize into clean paragraphs while preserving the speakers' exact meaning and voice.",
+          "Lightly edit this raw speech transcript for readability: fix punctuation, remove verbal filler words, and organize into clean paragraphs while preserving the speakers' exact meaning, language, and script (keep Amharic in Ethiopic script).",
       };
 
       const systemInstruction = prompts[task ?? "summary"] ?? prompts.summary;

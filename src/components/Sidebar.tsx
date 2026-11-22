@@ -261,6 +261,11 @@ export function Sidebar({
                   </option>
                 ))}
               </select>
+              {config.languageCode === "am-ET" && (
+                <p className="mt-1 text-[11px] leading-snug text-rose-600 dark:text-rose-400">
+                  Amharic focus active (am-ET · Ethiopic script)
+                </p>
+              )}
             </div>
 
             {config.mode === "SMART" && (

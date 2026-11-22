@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Check, Copy, Edit3, FileAudio, Loader2, Mic } from "lucide-react";
 import type {
   ConnectionState,
+  LiveRefinementStatus,
   TranscriptSegment,
   TranscriptionSession,
   UploadedChunkProgress,
@@ -17,6 +18,7 @@ interface TranscriptStreamProps {
   interimSpeaker: string;
   interimLanguage: string;
   connectionState: ConnectionState;
+  liveRefinementStatus?: LiveRefinementStatus | null;
   searchQuery: string;
   hasAudioPlayer: boolean;
   playbackTimeMs: number;
@@ -35,6 +37,7 @@ export function TranscriptStream({
   interimSpeaker,
   interimLanguage,
   connectionState,
+  liveRefinementStatus,
   searchQuery,
   hasAudioPlayer,
   playbackTimeMs,
@@ -256,12 +259,26 @@ export function TranscriptStream({
                       <span className="font-mono">{seg.languageCode}</span>
                     </>
                   )}
-                  {seg.isEdited && (
+                  {seg.isEdited ? (
                     <>
                       <span aria-hidden="true">·</span>
                       <span>Edited</span>
                     </>
-                  )}
+                  ) : seg.isRefined ? (
+                    <>
+                      <span aria-hidden="true">·</span>
+                      <span className="text-emerald-600 dark:text-emerald-400">
+                        Refined
+                      </span>
+                    </>
+                  ) : seg.isProvisional ? (
+                    <>
+                      <span aria-hidden="true">·</span>
+                      <span className="text-slate-400 dark:text-slate-500">
+                        Draft
+                      </span>
+                    </>
+                  ) : null}
                 </div>
 
                 <div className="flex items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
@@ -385,11 +402,19 @@ export function TranscriptStream({
                   ? chunkProgress.preRollStage === "segmenting"
                     ? "Transcribing · Segmenting audio into 15-second clips..."
                     : chunkProgress.preRollStage === "connecting"
-                      ? `Transcribing · Preparing ${chunkProgress.workerCount ?? 3} Live workers (${chunkProgress.readyWorkers ?? 0}/${chunkProgress.workerCount ?? 3} ready)...`
-                      : `Transcribing first 15s segment (${chunkProgress.readyWorkers ?? 0}/${chunkProgress.workerCount ?? 3} workers focused) · Playback opens once ready...`
-                  : `${chunkProgress.workerCount ?? 3} workers focusing on 15s segment ${chunkProgress.activeChunkIndices
+                      ? `Transcribing · Preparing ${chunkProgress.waveCount ?? 2} waves (${chunkProgress.readyWorkers ?? 0}/${chunkProgress.workerCount ?? 6} Live workers ready)...`
+                      : (chunkProgress.waveCount ?? 1) > 1
+                        ? `2 waves transcribing segments 1 & 2 (${chunkProgress.readyWorkers ?? 0}/${chunkProgress.workerCount ?? 6} workers focused) · Playback opens once segment 1 is ready...`
+                        : `Transcribing first 15s segment (${chunkProgress.readyWorkers ?? 0}/${chunkProgress.workerCount ?? 3} workers focused) · Playback opens once ready...`
+                  : `${
+                      chunkProgress.activeChunkIndices.length > 1
+                        ? `${chunkProgress.waveCount ?? 2} waves (${chunkProgress.workerCount ?? 6} workers)`
+                        : "3 workers"
+                    } focusing on 15s segment${
+                      chunkProgress.activeChunkIndices.length > 1 ? "s" : ""
+                    } ${chunkProgress.activeChunkIndices
                       .map((i) => i + 1)
-                      .join(", ")} of ${chunkProgress.totalChunks}...`}
+                      .join(" & ")} of ${chunkProgress.totalChunks}...`}
               </span>
             </div>
           )}
@@ -397,9 +422,19 @@ export function TranscriptStream({
         {/* Active streaming interim microphone transcription */}
         {(interimText.trim() || isListening) && (
           <div className="px-3 pt-1 pb-6">
-            <div className="mb-1.5 flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
-              <span className="font-medium text-rose-600 dark:text-rose-400">
-                Live
+            <div className="mb-1.5 flex flex-wrap items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
+              <span
+                className={`font-medium ${
+                  liveRefinementStatus?.liveWorkerStatus === "dropped"
+                    ? "text-amber-600 dark:text-amber-400"
+                    : "text-rose-600 dark:text-rose-400"
+                }`}
+              >
+                {liveRefinementStatus?.liveWorkerStatus === "dropped"
+                  ? "Live Dropped · 4 Backward Active"
+                  : liveRefinementStatus?.liveWorkerStatus === "reconnecting"
+                    ? "Live Reconnecting"
+                    : "Live"}
               </span>
               {interimSpeaker && (
                 <>
@@ -415,6 +450,16 @@ export function TranscriptStream({
                   <span className="font-mono">{interimLanguage}</span>
                 </>
               )}
+              {liveRefinementStatus && (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <span className="font-mono tabular-nums text-slate-400 dark:text-slate-500">
+                    10s window #{liveRefinementStatus.windowIndex + 1} (
+                    {(liveRefinementStatus.bufferElapsedMs / 1000).toFixed(1)}s/
+                    {(liveRefinementStatus.bufferDurationMs / 1000).toFixed(0)}s)
+                  </span>
+                </>
+              )}
             </div>
             <p className="text-[15.5px] leading-[1.7] text-slate-500 dark:text-slate-400">
               {interimText.trim() ? (
@@ -424,7 +469,9 @@ export function TranscriptStream({
                 </>
               ) : (
                 <span className="italic text-slate-400 dark:text-slate-500">
-                  Listening for speech...
+                  {liveRefinementStatus?.liveWorkerStatus === "dropped"
+                    ? "Live stream disconnected — 4 backward workers still buffering and refining 10s speech..."
+                    : "Listening for speech..."}
                 </span>
               )}
             </p>

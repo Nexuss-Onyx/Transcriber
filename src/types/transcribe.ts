@@ -15,9 +15,22 @@ export interface TranscriptSegment {
   timestampMs: number;
   endTimestampMs?: number;
   chunkIndex?: number;
+  liveWindowIndex?: number;
+  liveHalfIndex?: number;
+  isProvisional?: boolean;
+  isRefined?: boolean;
   startOffset?: string;
   words?: WordTiming[];
   isEdited?: boolean;
+}
+
+export interface LiveRefinementStatus {
+  windowIndex: number;
+  bufferElapsedMs: number;
+  bufferDurationMs: number;
+  refiningWindowsCount: number;
+  refinedWindowsCount: number;
+  liveWorkerStatus: "connecting" | "connected" | "reconnecting" | "dropped";
 }
 
 export interface TranscriptionConfig {
@@ -40,6 +53,7 @@ export interface UploadedChunkProgress {
   completedChunks: number;
   completedChunkIndices: number[];
   activeChunkIndices: number[];
+  waveCount?: number;
   workerCount?: number;
   readyWorkers?: number;
   preRollStage?: "segmenting" | "connecting" | "transcribing";

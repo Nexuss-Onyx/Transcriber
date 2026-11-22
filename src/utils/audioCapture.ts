@@ -92,7 +92,7 @@ export function applySpeechHighPassFilter(
 /**
  * Soft-knee gain conditioning for quiet audio segments without clipping peaks.
  */
-function normalizeSpeechDynamics(samples: Float32Array): Float32Array {
+export function normalizeSpeechDynamics(samples: Float32Array): Float32Array {
   if (samples.length === 0) return samples;
   let sumSq = 0;
   let peak = 0;
@@ -542,6 +542,35 @@ export function scriptFamilyToBcp47(family: string | null): string | null {
       return "ko-KR";
     case "cjk":
       return "zh-CN";
+    default:
+      return null;
+  }
+}
+
+export function bcp47ToScriptFamily(code?: string | null): string | null {
+  if (!code || code === "auto") return null;
+  const base = code.toLowerCase().split("-")[0];
+  switch (base) {
+    case "am":
+    case "ti":
+      return "ethiopic";
+    case "hi":
+      return "devanagari";
+    case "ar":
+      return "arabic";
+    case "ja":
+      return "japanese";
+    case "ko":
+      return "korean";
+    case "zh":
+      return "cjk";
+    case "en":
+    case "es":
+    case "fr":
+    case "de":
+    case "it":
+    case "pt":
+      return "latin";
     default:
       return null;
   }
