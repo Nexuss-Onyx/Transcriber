@@ -9,6 +9,7 @@ import {
   createStreamingSpeechConditioner,
   detectScriptFamily,
   downsampleBuffer,
+  encodeFloat32ToWavBase64,
   float32ToBase64Pcm16,
   formatDuration,
   formatSpeakerDisplay,
@@ -49,13 +50,31 @@ test("downsampleBuffer performs 3:1 box decimation from 48kHz to 16kHz", () => {
   assert.equal(out[1], 5);
 });
 
-test("float32ToBase64Pcm16 encodes PCM16 little-endian bytes", () => {
-  const b64 = float32ToBase64Pcm16(new Float32Array([0, 1, -1]));
+test("float32ToBase64Pcm16 and encodeFloat32ToWavBase64 encode valid PCM16 and RIFF WAV bytes", () => {
+  const samples = new Float32Array([0, 1, -1]);
+  const b64 = float32ToBase64Pcm16(samples);
   const buf = Buffer.from(b64, "base64");
   assert.equal(buf.length, 6);
   assert.equal(buf.readInt16LE(0), 0);
   assert.equal(buf.readInt16LE(2), 0x7fff);
   assert.equal(buf.readInt16LE(4), -0x8000);
+
+  const wavB64 = encodeFloat32ToWavBase64(samples, 16000);
+  const wav = Buffer.from(wavB64, "base64");
+  assert.equal(wav.length, 44 + 6);
+  assert.equal(wav.subarray(0, 4).toString("ascii"), "RIFF");
+  assert.equal(wav.readUInt32LE(4), 36 + 6);
+  assert.equal(wav.subarray(8, 12).toString("ascii"), "WAVE");
+  assert.equal(wav.subarray(12, 16).toString("ascii"), "fmt ");
+  assert.equal(wav.readUInt16LE(20), 1); // PCM
+  assert.equal(wav.readUInt16LE(22), 1); // Mono
+  assert.equal(wav.readUInt32LE(24), 16000);
+  assert.equal(wav.readUInt16LE(34), 16);
+  assert.equal(wav.subarray(36, 40).toString("ascii"), "data");
+  assert.equal(wav.readUInt32LE(40), 6);
+  assert.equal(wav.readInt16LE(44), 0);
+  assert.equal(wav.readInt16LE(46), 0x7fff);
+  assert.equal(wav.readInt16LE(48), -0x8000);
 });
 
 test("cleanTranscriptArtifacts fixes spacing and collapses 3+ word loops", () => {

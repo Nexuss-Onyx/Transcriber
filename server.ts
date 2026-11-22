@@ -12,10 +12,11 @@ import {
   type LiveServerMessage,
   type Session,
 } from "@google/genai";
-import { FrontierModelRouter } from "./server/modelRouter";
+import { FrontierModelRouter, classifyGeminiRouterError } from "./server/modelRouter";
 
 const PORT = 3000;
 const LIVE_TRANSCRIBE_MODEL = "gemini-3.5-transcribe-live";
+const STATIC_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
 const lmRouter = new FrontierModelRouter();
 
 function getAiClient(apiVersion?: string): GoogleGenAI {
@@ -199,7 +200,92 @@ async function startServer(): Promise<void> {
     }
   });
 
-  // Under-the-hood 1-minute multi-worker transcript refinement using frontier-to-down router
+  // Lossless static WAV audio transcription worker using gemini-3.5-transcribe
+  // with frontier-to-down multimodal failover on transient/quota/availability errors
+  app.post("/api/transcribe-audio", async (req, res) => {
+    try {
+      const { wavBase64, languageCode, customVocabulary, mode } = req.body as {
+        wavBase64?: string;
+        languageCode?: string;
+        customVocabulary?: string[];
+        mode?: "VERBATIM" | "SMART";
+      };
+
+      const cleanWav = typeof wavBase64 === "string" ? wavBase64.trim() : "";
+      if (!cleanWav || cleanWav.length > 16_000_000) {
+        res.status(400).json({ error: "Invalid or missing wavBase64 payload." });
+        return;
+      }
+
+      const ai = getAiClient("v1beta");
+      const cleanVocab = Array.isArray(customVocabulary)
+        ? customVocabulary.map((v) => String(v).trim()).filter(Boolean).slice(0, 120)
+        : [];
+      const langHint =
+        typeof languageCode === "string" && languageCode.trim() && languageCode !== "auto"
+          ? languageCode.trim()
+          : "auto";
+      const isSmart = mode === "SMART";
+
+      const promptLines = [
+        isSmart
+          ? "Transcribe the attached audio accurately in natural spoken form with clean punctuation and capitalization."
+          : "Transcribe the attached audio strictly verbatim word-for-word, preserving contractions, informal speech, slang, and repetitions.",
+        langHint !== "auto"
+          ? `Expected language code: ${langHint}. Use the native script for that language (e.g., strictly Ethiopic/Ge'ez script for Amharic am-ET, Latin script for English).`
+          : "Use the native script of the spoken language(s) (e.g., Ethiopic/Ge'ez script for Amharic, Latin script for English).",
+        cleanVocab.length > 0
+          ? `Prioritize accurate spelling for these domain terms/names when heard: ${cleanVocab.join(", ")}.`
+          : "",
+        "Return ONLY the spoken words as plain text with zero commentary, timestamps, speaker labels, or quotes. If only silence or non-speech noise is present, return an empty string.",
+      ]
+        .filter(Boolean)
+        .join("\n");
+
+      const parts = [
+        { inlineData: { mimeType: "audio/wav", data: cleanWav } },
+        { text: promptLines },
+      ];
+
+      let modelUsed = STATIC_TRANSCRIBE_MODEL;
+      let transcriptText = "";
+
+      try {
+        const directRes = await ai.models.generateContent({
+          model: STATIC_TRANSCRIBE_MODEL,
+          contents: parts,
+        });
+        transcriptText = (directRes.text ?? "").trim();
+      } catch (directErr) {
+        const kind = classifyGeminiRouterError(directErr);
+        if (kind === "auth") {
+          throw directErr;
+        }
+        const fallback = await lmRouter.executeWithFailover((model) =>
+          ai.models.generateContent({
+            model,
+            contents: parts,
+          })
+        );
+        modelUsed = fallback.modelUsed;
+        transcriptText = (fallback.result.text ?? "").trim();
+      }
+
+      // Guard against accidental empty-marker strings
+      const normalized =
+        transcriptText === '""' || transcriptText === "''" ? "" : transcriptText;
+
+      res.json({
+        text: normalized,
+        modelUsed,
+      });
+    } catch (err) {
+      console.error("Static WAV transcription error:", err);
+      res.status(500).json({ error: formatGeminiError(err) });
+    }
+  });
+
+  // Under-the-hood multimodal audio + multi-worker transcript refinement using frontier-to-down router
   app.post("/api/refine-transcript", async (req, res) => {
     try {
       const {
@@ -214,6 +300,10 @@ async function startServer(): Promise<void> {
           startMs: number;
           endMs: number;
           workers: Record<string, string>;
+          audioAttachment?: {
+            hqWavBase64?: string;
+            rawWavBase64?: string;
+          };
         }>;
         priorContext?: string;
         languageCode?: string;
@@ -228,17 +318,21 @@ async function startServer(): Promise<void> {
 
       const isUpload5W = scope === "upload_5w";
       const isUpload3W = scope === "upload_3w";
-      const boundedWindows = windows.slice(0, 24).map((w) => ({
+
+      const sanitizedSlice = windows.slice(0, 24);
+      const boundedWindows = sanitizedSlice.map((w) => ({
         windowIndex: Number(w.windowIndex),
         startMs: Number(w.startMs),
         endMs: Number(w.endMs),
         workers: isUpload5W
           ? {
-              worker_1_raw_wave_primary: String(w.workers?.worker1LiveRealtime ?? "").trim(),
-              worker_2_raw_wave_contrast: String(w.workers?.worker2FirstHalfPrimary ?? "").trim(),
-              worker_3_hq_wave_verbatim: String(w.workers?.worker3FirstHalfContrast ?? "").trim(),
-              worker_4_hq_wave_smart: String(w.workers?.worker4SecondHalfPrimary ?? "").trim(),
+              worker_1_raw_ws_verbatim: String(w.workers?.worker1LiveRealtime ?? "").trim(),
+              worker_2_raw_ws_smart: String(w.workers?.worker2FirstHalfPrimary ?? "").trim(),
+              worker_3_hq_ws_verbatim: String(w.workers?.worker3FirstHalfContrast ?? "").trim(),
+              worker_4_hq_ws_smart: String(w.workers?.worker4SecondHalfPrimary ?? "").trim(),
               worker_5_hq_vocal_clarity: String(w.workers?.worker5SecondHalfContrast ?? "").trim(),
+              worker_7_static_hq_wav: String(w.workers?.worker7StaticHqWav ?? "").trim(),
+              worker_8_static_raw_wav: String(w.workers?.worker8StaticRawWav ?? "").trim(),
             }
           : isUpload3W
             ? {
@@ -253,32 +347,90 @@ async function startServer(): Promise<void> {
                 worker_4_first_half_raw: String(w.workers?.worker3FirstHalfContrast ?? "").trim(),
                 worker_5_second_half_hq: String(w.workers?.worker4SecondHalfPrimary ?? "").trim(),
                 worker_6_second_half_raw: String(w.workers?.worker5SecondHalfContrast ?? "").trim(),
+                worker_7_static_hq_wav: String(w.workers?.worker7StaticHqWav ?? "").trim(),
+                worker_8_static_raw_wav: String(w.workers?.worker8StaticRawWav ?? "").trim(),
               },
       }));
 
+      // Collect lossless WAV audio parts (capped at 8 inline audio parts per call)
+      const audioParts: Array<
+        { text: string } | { inlineData: { mimeType: string; data: string } }
+      > = [];
+      const attachedWindowIndices: number[] = [];
+      let audioPartCount = 0;
+
+      for (const w of sanitizedSlice) {
+        const hqWav =
+          typeof w.audioAttachment?.hqWavBase64 === "string"
+            ? w.audioAttachment.hqWavBase64.trim()
+            : "";
+        const rawWav =
+          typeof w.audioAttachment?.rawWavBase64 === "string"
+            ? w.audioAttachment.rawWavBase64.trim()
+            : "";
+
+        if (hqWav && hqWav.length < 12_000_000 && audioPartCount < 8) {
+          audioParts.push({
+            text: `AUDIO_GROUND_TRUTH (High-Quality 16kHz WAV) for windowIndex ${Number(w.windowIndex)} (${Number(w.startMs)}ms..${Number(w.endMs)}ms):`,
+          });
+          audioParts.push({
+            inlineData: { mimeType: "audio/wav", data: hqWav },
+          });
+          attachedWindowIndices.push(Number(w.windowIndex));
+          audioPartCount++;
+        }
+
+        // For focused small batches (1-2 windows), also attach raw unmodified WAV for dual acoustic contrast
+        if (
+          sanitizedSlice.length <= 2 &&
+          rawWav &&
+          rawWav.length < 12_000_000 &&
+          audioPartCount < 8
+        ) {
+          audioParts.push({
+            text: `AUDIO_RAW_CONTRAST (Unfiltered 16kHz WAV) for windowIndex ${Number(w.windowIndex)}:`,
+          });
+          audioParts.push({
+            inlineData: { mimeType: "audio/wav", data: rawWav },
+          });
+          if (!attachedWindowIndices.includes(Number(w.windowIndex))) {
+            attachedWindowIndices.push(Number(w.windowIndex));
+          }
+          audioPartCount++;
+        }
+      }
+
+      const hasAudioGroundTruth = audioPartCount > 0;
       const ai = getAiClient("v1beta");
       const cleanVocab = Array.isArray(customVocabulary)
         ? customVocabulary.map((v) => String(v).trim()).filter(Boolean).slice(0, 120)
         : [];
 
       const workerTopologyLine = isUpload5W
-        ? "Each window contains the independent raw outputs of 5 focused ASR workers that all listened to the EXACT SAME full audio segment independently (2 on the raw unmodified audio waveform and 3 on high-quality speech-conditioned waveforms)."
+        ? "Each window contains the independent raw outputs of up to 7 ASR workers (5 parallel live-stream WebSocket passes across raw/HQ/clarified waveforms + 2 static lossless WAV workers) for the EXACT SAME audio segment."
         : isUpload3W
           ? "Each window contains the independent raw outputs of 3 parallel ASR workers each listening to the ENTIRE audio chunk independently."
-          : "Each window contains the independent raw outputs of up to 6 ASR workers covering the same 10s live audio window: worker_1 (live raw stream) & worker_2 (live high-quality conditioned stream) cover the full window; worker_3 (HQ) & worker_4 (raw) independently transcribe the first half; worker_5 (HQ) & worker_6 (raw) independently transcribe the second half. Combine first-half and second-half consensus cleanly against both full-window live workers.";
+          : "Each window contains the independent raw outputs of up to 8 ASR workers covering the same 10s live audio window: worker_1 (live raw stream), worker_2 (live HQ stream), worker_3..worker_6 (first-half & second-half HQ/raw passes), and worker_7..worker_8 (full-window lossless static WAV passes).";
 
       const systemInstruction = [
-        "You are an under-the-hood multi-worker speech-to-text reconstruction engine.",
-        "You receive a structured JSON batch of time-ordered speech windows.",
+        "You are an under-the-hood multimodal audio + multi-worker speech-to-text reconstruction engine.",
+        hasAudioGroundTruth
+          ? "You receive BOTH the actual lossless 16kHz WAV audio waveform(s) for the speech windows AND a structured JSON batch of independent ASR worker hypotheses."
+          : "You receive a structured JSON batch of time-ordered speech windows with independent ASR worker hypotheses.",
         workerTopologyLine,
         "",
         "CORE RECONSTRUCTION RULES:",
-        "1. CONSENSUS WINS ('more workers agreeing beats a single outlier'): Compare all available workers word-by-word and phonetically. Never let an empty or hallucinating single worker override valid words heard by other workers.",
-        "2. CONTEXTUAL & PHONETIC RECOVERY: Real speech ASR workers frequently miss articles/endings, mishear homophones, split/merge words, or stumble on informal conversation, fast English speech, slang, contractions ('gonna', 'wanna', 'kinda', 'don't'), idioms, technical terms, names, numbers, or mixed-language code-switching (including Amharic Ge'ez script + English). Comprehend what the speaker actually meant using cross-worker evidence and priorContext, and reconstruct the exact natural spoken sentence(s).",
-        "3. STRICTLY NO ESSAYS OR INVENTED CONTENT: Never expand, summarize, answer questions, add commentary, add explanations, or generate unstated sentences. Your output for each window MUST strictly represent only the words spoken in that window, matching the natural length and propositions of the worker inputs.",
+        ...(hasAudioGroundTruth
+          ? [
+              "0. DIRECT ACOUSTIC GROUND TRUTH: Listen carefully to EVERY attached audio/wav waveform alongside the worker hypotheses. Recover any dropped words, clipped syllables, quiet endings, misheard names, informal contractions, or Amharic/English phonetic errors directly from what is actually spoken in the audio. When an ASR worker omitted or distorted words clearly audible in the WAV, restore the exact spoken words; when a worker hallucinated words not audible in the WAV, reject them.",
+            ]
+          : []),
+        "1. CONSENSUS WINS ('more workers agreeing beats a single outlier'): Compare all available workers word-by-word and phonetically against the audio. Never let an empty or hallucinating single worker override valid words heard in the audio or agreed upon by multiple workers.",
+        "2. CONTEXTUAL & PHONETIC RECOVERY: Real speech ASR workers frequently miss articles/endings, mishear homophones, split/merge words, or stumble on informal conversation, fast English speech, slang, contractions ('gonna', 'wanna', 'kinda', 'don't'), idioms, technical terms, names, numbers, or mixed-language code-switching (including Amharic Ge'ez script + English). Comprehend what the speaker actually said using the audio + cross-worker evidence + priorContext, and output the exact natural spoken sentence(s).",
+        "3. STRICTLY NO ESSAYS OR INVENTED CONTENT: Never expand, summarize, answer questions, add commentary, add explanations, or generate unstated sentences. Your output for each window MUST strictly represent only the words spoken in that window, matching the natural length and propositions of the speech.",
         "4. INFORMAL SPEECH FIDELITY: Preserve casual/conversational tone and slang faithfully; only fix garbled ASR mishearings, spacing, punctuation, and casing. Do not turn casual talk into formal essays.",
         "5. CONTINUITY WITHOUT DUPLICATION: Use priorContext strictly to resolve ambiguous words or grammar across window boundaries. Never repeat sentences from priorContext or duplicate words already finished in an earlier window.",
-        "6. EMPTY / NOISE HANDLING: If all workers for a window are empty or pure noise artifacts, return an empty string \"\" for refinedText.",
+        "6. EMPTY / NOISE HANDLING: If a window contains only silence or non-speech artifacts, return an empty string \"\" for refinedText.",
         "7. SCRIPT & LANGUAGE FIDELITY: Respect the language spoken (and languageCode hint when provided). Keep English in clean Latin script and Amharic in Ethiopic (Ge'ez) script; allow natural mixed-language phrases when genuinely spoken.",
         "8. STRICT OUTPUT FORMAT: Return ONLY valid JSON matching the responseSchema with one entry for every input windowIndex, preserving each exact windowIndex integer.",
       ].join("\n");
@@ -288,38 +440,73 @@ async function startServer(): Promise<void> {
         customVocabulary: cleanVocab,
         priorContext:
           typeof priorContext === "string" ? priorContext.trim().slice(-600) : "",
+        attachedAudioWindowIndices: attachedWindowIndices,
         windows: boundedWindows,
       };
 
-      const { modelUsed, result: response } = await lmRouter.executeWithFailover(
-        (model) =>
-          ai.models.generateContent({
-            model,
-            contents: JSON.stringify(payload),
-            config: {
-              systemInstruction,
-              responseMimeType: "application/json",
-              responseSchema: {
+      const responseConfig = {
+        systemInstruction,
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            refinedWindows: {
+              type: Type.ARRAY,
+              items: {
                 type: Type.OBJECT,
                 properties: {
-                  refinedWindows: {
-                    type: Type.ARRAY,
-                    items: {
-                      type: Type.OBJECT,
-                      properties: {
-                        windowIndex: { type: Type.INTEGER },
-                        refinedText: { type: Type.STRING },
-                        detectedLanguage: { type: Type.STRING },
-                      },
-                      required: ["windowIndex", "refinedText"],
-                    },
-                  },
+                  windowIndex: { type: Type.INTEGER },
+                  refinedText: { type: Type.STRING },
+                  detectedLanguage: { type: Type.STRING },
                 },
-                required: ["refinedWindows"],
+                required: ["windowIndex", "refinedText"],
               },
             },
+          },
+          required: ["refinedWindows"],
+        },
+      };
+
+      const jsonText = JSON.stringify(payload);
+      let routerOutcome: {
+        modelUsed: string;
+        result: Awaited<ReturnType<typeof ai.models.generateContent>>;
+      };
+
+      if (hasAudioGroundTruth) {
+        try {
+          routerOutcome = await lmRouter.executeWithFailover((model) =>
+            ai.models.generateContent({
+              model,
+              contents: [...audioParts, { text: jsonText }],
+              config: responseConfig,
+            })
+          );
+        } catch (multimodalErr) {
+          const kind = classifyGeminiRouterError(multimodalErr);
+          if (kind === "auth") {
+            throw multimodalErr;
+          }
+          // Safe fallback to text-only consensus if multimodal payload failed
+          routerOutcome = await lmRouter.executeWithFailover((model) =>
+            ai.models.generateContent({
+              model,
+              contents: jsonText,
+              config: responseConfig,
+            })
+          );
+        }
+      } else {
+        routerOutcome = await lmRouter.executeWithFailover((model) =>
+          ai.models.generateContent({
+            model,
+            contents: jsonText,
+            config: responseConfig,
           })
-      );
+        );
+      }
+
+      const { modelUsed, result: response } = routerOutcome;
 
       let parsed: {
         refinedWindows?: Array<{
@@ -365,6 +552,7 @@ async function startServer(): Promise<void> {
       res.json({
         refinedWindows: normalized,
         modelUsed,
+        multimodalAudioUsed: hasAudioGroundTruth,
       });
     } catch (err) {
       console.error("Structured transcript refinement error:", err);

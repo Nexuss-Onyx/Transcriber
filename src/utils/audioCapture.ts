@@ -212,6 +212,52 @@ export function float32ToBase64Pcm16(float32: Float32Array): string {
   return uint8ToBase64(new Uint8Array(int16.buffer));
 }
 
+export function encodeFloat32ToWavBase64(
+  samples: Float32Array,
+  sampleRate = 16000
+): string {
+  const numChannels = 1;
+  const bitsPerSample = 16;
+  const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
+  const blockAlign = numChannels * (bitsPerSample / 8);
+  const dataByteLength = samples.length * 2;
+  const buffer = new ArrayBuffer(44 + dataByteLength);
+  const view = new DataView(buffer);
+
+  const writeAscii = (offset: number, text: string) => {
+    for (let i = 0; i < text.length; i++) {
+      view.setUint8(offset + i, text.charCodeAt(i));
+    }
+  };
+
+  writeAscii(0, "RIFF");
+  view.setUint32(4, 36 + dataByteLength, true);
+  writeAscii(8, "WAVE");
+  writeAscii(12, "fmt ");
+  view.setUint32(16, 16, true); // PCM subchunk1 size
+  view.setUint16(20, 1, true); // PCM audio format
+  view.setUint16(22, numChannels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, byteRate, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, bitsPerSample, true);
+  writeAscii(36, "data");
+  view.setUint32(40, dataByteLength, true);
+
+  let offset = 44;
+  for (let i = 0; i < samples.length; i++) {
+    const clamped = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(
+      offset,
+      clamped < 0 ? Math.round(clamped * 0x8000) : Math.round(clamped * 0x7fff),
+      true
+    );
+    offset += 2;
+  }
+
+  return uint8ToBase64(new Uint8Array(buffer));
+}
+
 function uint8ToBase64(bytes: Uint8Array): string {
   let binary = "";
   const chunkSize = 0x8000;
@@ -230,13 +276,17 @@ export interface AudioPcmChunk {
   pcmPacketsBase64: string[];
   clarifiedPacketsBase64: string[];
   rawPacketsBase64: string[];
+  hqWavBase64: string;
+  clarifiedWavBase64: string;
+  rawWavBase64: string;
   hasAudioSignal: boolean;
 }
 
 export async function sliceAudioFileIntoLiveChunks(
   file: File,
   chunkDurationSec = 15,
-  samplesPerPacket = 2048 // 128ms per 16kHz PCM packet (matches live mic cadence)
+  samplesPerPacket = 2048, // 128ms per 16kHz PCM packet (matches live mic cadence)
+  maxChunks?: number
 ): Promise<{ totalDurationMs: number; chunks: AudioPcmChunk[] }> {
   const arrayBuffer = await file.arrayBuffer();
   const AudioCtx =
@@ -308,8 +358,7 @@ export async function sliceAudioFileIntoLiveChunks(
     let index = 0;
     let startSample = 0;
 
-    const packetize = (samples: Float32Array, hasSignal: boolean): string[] => {
-      const ds = downsampleBuffer(samples, srcRate, 16000);
+    const packetizeDs = (ds: Float32Array, hasSignal: boolean): string[] => {
       const pkts: string[] = [];
       // 512ms (4x128ms) silent VAD warm-up lead-in so opening words never clip
       if (hasSignal && ds.length > 0) {
@@ -338,6 +387,10 @@ export async function sliceAudioFileIntoLiveChunks(
     };
 
     while (startSample < mono.length) {
+      if (typeof maxChunks === "number" && maxChunks > 0 && chunks.length >= maxChunks) {
+        break;
+      }
+
       const nominalEnd = (index + 1) * samplesPerChunk;
       const endSample =
         nominalEnd >= mono.length - Math.floor(0.8 * srcRate)
@@ -399,21 +452,33 @@ export async function sliceAudioFileIntoLiveChunks(
             )
           : endSec;
 
-      // Add 0.55s acoustic lead-in overlap for chunks > 0 so boundary syllables never clip
+      // Add 0.65s acoustic lead-in overlap for chunks > 0 so boundary syllables never clip
       const streamStartSample =
         index > 0 ? Math.max(0, startSample - leadInSamples) : startSample;
       const streamSlice = mono.subarray(streamStartSample, endSample);
       const rawSlice = rawMono.subarray(streamStartSample, endSample);
 
-      const pcmPacketsBase64 = packetize(
-        normalizeSpeechDynamics(streamSlice),
-        hasAudioSignal
-      );
-      const clarifiedPacketsBase64 = packetize(
+      const dsHq = downsampleBuffer(normalizeSpeechDynamics(streamSlice), srcRate, 16000);
+      const dsClarified = downsampleBuffer(
         applyVocalPresenceConditioning(streamSlice),
-        hasAudioSignal
+        srcRate,
+        16000
       );
-      const rawPacketsBase64 = packetize(rawSlice, hasAudioSignal);
+      const dsRaw = downsampleBuffer(rawSlice, srcRate, 16000);
+
+      const pcmPacketsBase64 = packetizeDs(dsHq, hasAudioSignal);
+      const clarifiedPacketsBase64 = packetizeDs(dsClarified, hasAudioSignal);
+      const rawPacketsBase64 = packetizeDs(dsRaw, hasAudioSignal);
+
+      const hqWavBase64 = hasAudioSignal
+        ? encodeFloat32ToWavBase64(dsHq, 16000)
+        : "";
+      const clarifiedWavBase64 = hasAudioSignal
+        ? encodeFloat32ToWavBase64(dsClarified, 16000)
+        : "";
+      const rawWavBase64 = hasAudioSignal
+        ? encodeFloat32ToWavBase64(dsRaw, 16000)
+        : "";
 
       chunks.push({
         index,
@@ -426,6 +491,9 @@ export async function sliceAudioFileIntoLiveChunks(
         pcmPacketsBase64,
         clarifiedPacketsBase64,
         rawPacketsBase64,
+        hqWavBase64,
+        clarifiedWavBase64,
+        rawWavBase64,
         hasAudioSignal,
       });
 

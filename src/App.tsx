@@ -58,7 +58,9 @@ import {
   stitchChunkBoundary,
 } from "./utils/audioCapture";
 import {
+  SINGLE_SEGMENT_ONLY,
   WORKERS_PER_WAVE,
+  getFocusedChunkLimit,
   getWaveCount,
   pickNextWaveSegment,
   shouldInterruptWaveOnSeek,
@@ -98,6 +100,47 @@ function isFatalConfigErrorMessage(msg: string): boolean {
     lower.includes("permission denied") ||
     lower.includes("not configured")
   );
+}
+
+async function transcribeWavWorker(params: {
+  wavBase64: string;
+  languageCode?: string;
+  customVocabulary?: string[];
+  mode: "VERBATIM" | "SMART";
+  signal: AbortSignal;
+}): Promise<{ text: string; fatalError?: string }> {
+  if (!params.wavBase64 || params.signal.aborted) {
+    return { text: "" };
+  }
+  try {
+    const res = await fetch("/api/transcribe-audio", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        wavBase64: params.wavBase64,
+        languageCode: params.languageCode,
+        customVocabulary: params.customVocabulary,
+        mode: params.mode,
+      }),
+      signal: params.signal,
+    });
+    const data = (await res.json().catch(() => ({}))) as {
+      text?: string;
+      error?: string;
+    };
+    if (!res.ok) {
+      const errMsg = data.error || `Static transcription failed (${res.status}).`;
+      if (isFatalConfigErrorMessage(errMsg)) {
+        return { text: "", fatalError: errMsg };
+      }
+      return { text: "" };
+    }
+    return {
+      text: cleanTranscriptArtifacts(data.text ?? ""),
+    };
+  } catch {
+    return { text: "" };
+  }
 }
 
 function createDefaultConfig(): TranscriptionConfig {
@@ -185,12 +228,16 @@ export default function App() {
     useState<UploadedChunkProgress | null>(null);
   const [playbackTimeMs, setPlaybackTimeMs] = useState(0);
   const [isAudioPlaying, setIsAudioPlaying] = useState(false);
+  const [segmentPlaybackCapMs, setSegmentPlaybackCapMs] = useState<number | null>(
+    null
+  );
   const audioElRef = useRef<HTMLAudioElement | null>(null);
   const uploadAbortRef = useRef<AbortController | null>(null);
   const isAudioPlayingRef = useRef(false);
   const audioPlaybackEndedRef = useRef(false);
   const isPreBufferingRef = useRef(false);
   const uploadSeekSeqRef = useRef(0);
+  const segmentPlaybackCapMsRef = useRef<number | null>(null);
 
   useEffect(() => {
     isAudioPlayingRef.current = isAudioPlaying;
@@ -390,85 +437,92 @@ export default function App() {
         const due = collectDueRefinementWindows(lp.structuredWindows);
         if (due.length === 0) return;
 
-        const targetSess = sessionsRef.current.find(
-          (s) => s.id === targetSessionId
-        );
-        const priorContext = buildPriorContextSnippet(
-          targetSess?.segments ?? [],
-          due[0].windowIndex,
-          600
-        );
+        // Batch in groups of 6 windows (<= 60s of 16kHz WAVs) so multimodal
+        // audio payloads stay crisp and well under request caps
+        for (let offset = 0; offset < due.length; offset += 6) {
+          if (signal.aborted || lp.runId !== runId) return;
+          const batch = due.slice(offset, offset + 6);
+          const targetSess = sessionsRef.current.find(
+            (s) => s.id === targetSessionId
+          );
+          const priorContext = buildPriorContextSnippet(
+            targetSess?.segments ?? [],
+            batch[0].windowIndex,
+            600
+          );
 
-        try {
-          const res = await fetch("/api/refine-transcript", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              windows: due,
-              priorContext,
-              languageCode: lp.configSnapshot.languageCode,
-              customVocabulary: lp.configSnapshot.customVocabulary,
-              scope: "live_6w",
-            }),
-            signal,
-          });
-          if (!res.ok) return;
+          try {
+            const res = await fetch("/api/refine-transcript", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                windows: batch,
+                priorContext,
+                languageCode: lp.configSnapshot.languageCode,
+                customVocabulary: lp.configSnapshot.customVocabulary,
+                scope: "live_6w",
+              }),
+              signal,
+            });
+            if (!res.ok) continue;
 
-          const data = (await res.json()) as {
-            refinedWindows?: Array<{
-              windowIndex: number;
-              refinedText: string;
-              detectedLanguage?: string;
-            }>;
-          };
+            const data = (await res.json()) as {
+              refinedWindows?: Array<{
+                windowIndex: number;
+                refinedText: string;
+                detectedLanguage?: string;
+              }>;
+            };
 
-          if (
-            signal.aborted ||
-            lp.runId !== runId ||
-            !Array.isArray(data.refinedWindows) ||
-            data.refinedWindows.length === 0
-          ) {
-            return;
-          }
-
-          for (const item of data.refinedWindows) {
-            const winEntry = lp.structuredWindows.get(item.windowIndex);
-            if (winEntry) {
-              winEntry.lmRefined = true;
+            if (
+              signal.aborted ||
+              lp.runId !== runId ||
+              !Array.isArray(data.refinedWindows) ||
+              data.refinedWindows.length === 0
+            ) {
+              continue;
             }
-          }
 
-          const fallbackLang =
-            lp.lockedAutoLang ??
-            (lp.configSnapshot.languageCode === "auto"
-              ? undefined
-              : lp.configSnapshot.languageCode);
-
-          const detectedFromLm = data.refinedWindows
-            .map((w) => w.detectedLanguage)
-            .filter((l): l is string => Boolean(l));
-
-          updateSessionById(targetSessionId, (s) => {
-            let mergedLangs = s.detectedLanguages;
-            for (const nl of detectedFromLm) {
-              if (!mergedLangs.includes(nl)) {
-                mergedLangs = [...mergedLangs, nl];
+            for (const item of data.refinedWindows) {
+              const winEntry = lp.structuredWindows.get(item.windowIndex);
+              if (winEntry) {
+                winEntry.lmRefined = true;
+                winEntry.audioAttachment = undefined;
               }
             }
-            return {
-              ...s,
-              segments: applyLmRefinedWindowsToSegments(
-                s.segments,
-                lp.structuredWindows,
-                data.refinedWindows!,
-                fallbackLang
-              ),
-              detectedLanguages: mergedLangs,
-              updatedAt: Date.now(),
-            };
-          });
-        } catch {
-          // Stay silent under the hood; keep windows queued for next minute pass
+
+            const fallbackLang =
+              lp.lockedAutoLang ??
+              (lp.configSnapshot.languageCode === "auto"
+                ? undefined
+                : lp.configSnapshot.languageCode);
+
+            const detectedFromLm = data.refinedWindows
+              .map((w) => w.detectedLanguage)
+              .filter((l): l is string => Boolean(l));
+
+            updateSessionById(targetSessionId, (s) => {
+              let mergedLangs = s.detectedLanguages;
+              for (const nl of detectedFromLm) {
+                if (!mergedLangs.includes(nl)) {
+                  mergedLangs = [...mergedLangs, nl];
+                }
+              }
+              return {
+                ...s,
+                segments: applyLmRefinedWindowsToSegments(
+                  s.segments,
+                  lp.structuredWindows,
+                  data.refinedWindows!,
+                  fallbackLang
+                ),
+                detectedLanguages: mergedLangs,
+                updatedAt: Date.now(),
+              };
+            });
+          } catch {
+            // Stay silent under the hood; keep unrefined windows queued for next pass
+          }
         }
       };
 
@@ -719,44 +773,63 @@ export default function App() {
         const contrastMode: "VERBATIM" | "SMART" =
           configSnapshot.mode === "SMART" ? "VERBATIM" : "SMART";
 
-        const halfPairOutputs = await Promise.all(
-          activeHalves.map(async (half) => {
-            const prevIdx = half.halfIndex - 1;
-            const prevText =
-              prevIdx >= 0 && lp.runId === runId && lp.rawHalfTexts[prevIdx]
-                ? lp.rawHalfTexts[prevIdx].slice(-220)
-                : undefined;
-            const langSnapshot = lp.runId === runId ? lp.lockedAutoLang : null;
+        const liveLangSnapshot = lp.runId === runId ? lp.lockedAutoLang : null;
+        const [halfPairOutputs, staticHqRes, staticRawRes] = await Promise.all([
+          Promise.all(
+            activeHalves.map(async (half) => {
+              const prevIdx = half.halfIndex - 1;
+              const prevText =
+                prevIdx >= 0 && lp.runId === runId && lp.rawHalfTexts[prevIdx]
+                  ? lp.rawHalfTexts[prevIdx].slice(-220)
+                  : undefined;
 
-            const workers = await Promise.all([
-              // Worker A (High-quality conditioned speech wave, configured mode, true 128ms pace)
-              runBackwardSinglePass(
-                half,
-                false,
-                configSnapshot.mode,
-                128,
-                langSnapshot,
-                prevText
-              ),
-              // Worker B (Raw input wave, contrasting mode, true 128ms pace)
-              runBackwardSinglePass(
-                half,
-                true,
-                contrastMode,
-                128,
-                langSnapshot,
-                prevText
-              ),
-            ]);
-            return { half, workers };
-          })
-        );
+              const workers = await Promise.all([
+                // Worker A (High-quality conditioned speech wave, configured mode, true 128ms pace)
+                runBackwardSinglePass(
+                  half,
+                  false,
+                  configSnapshot.mode,
+                  128,
+                  liveLangSnapshot,
+                  prevText
+                ),
+                // Worker B (Raw input wave, contrasting mode, true 128ms pace)
+                runBackwardSinglePass(
+                  half,
+                  true,
+                  contrastMode,
+                  128,
+                  liveLangSnapshot,
+                  prevText
+                ),
+              ]);
+              return { half, workers };
+            })
+          ),
+          // Lossless Static WAV Worker 7 (High-quality conditioned 10s WAV via gemini-3.5-transcribe)
+          transcribeWavWorker({
+            wavBase64: sliced.hqWavBase64,
+            languageCode: liveLangSnapshot ?? configSnapshot.languageCode,
+            customVocabulary: configSnapshot.customVocabulary,
+            mode: configSnapshot.mode,
+            signal,
+          }),
+          // Lossless Static WAV Worker 8 (Raw unfiltered 10s WAV via gemini-3.5-transcribe)
+          transcribeWavWorker({
+            wavBase64: sliced.rawWavBase64,
+            languageCode: liveLangSnapshot ?? configSnapshot.languageCode,
+            customVocabulary: configSnapshot.customVocabulary,
+            mode: contrastMode,
+            signal,
+          }),
+        ]);
 
         if (signal.aborted) return;
 
-        const fatalRes = halfPairOutputs
-          .flatMap((hp) => hp.workers)
-          .find((w) => w.fatalError);
+        const fatalRes =
+          halfPairOutputs.flatMap((hp) => hp.workers).find((w) => w.fatalError) ??
+          (staticHqRes.fatalError ? staticHqRes : undefined) ??
+          (staticRawRes.fatalError ? staticRawRes : undefined);
         if (fatalRes?.fatalError) {
           setErrorMessage(fatalRes.fatalError);
           return;
@@ -907,11 +980,11 @@ export default function App() {
 
         if (signal.aborted) return;
 
-        // Preserve all 4 backward worker outputs independently alongside Worker 1
-        // without discarding or letting one worker override another.
+        // Preserve all backward + lossless static WAV workers independently alongside live workers
+        // plus lossless WAV attachment for the Multimodal LM audit pass
         if (lp.runId === runId) {
-          const half0Pair = halfPairOutputs.find((hp) => hp.half.halfIndex === 0);
-          const half1Pair = halfPairOutputs.find((hp) => hp.half.halfIndex === 1);
+          const half0Pair = halfPairOutputs.find((hp) => hp.half.halfOffset === 0);
+          const half1Pair = halfPairOutputs.find((hp) => hp.half.halfOffset === 1);
           upsertBackwardWorkerObservations(
             lp.structuredWindows,
             sliced.windowIndex,
@@ -922,9 +995,50 @@ export default function App() {
               firstHalfContrast: half0Pair?.workers[1]?.text ?? "",
               secondHalfPrimary: half1Pair?.workers[0]?.text ?? "",
               secondHalfContrast: half1Pair?.workers[1]?.text ?? "",
+              staticHqWav: staticHqRes.text,
+              staticRawWav: staticRawRes.text,
+              audioAttachment: {
+                hqWavBase64: sliced.hqWavBase64,
+                rawWavBase64: sliced.rawWavBase64,
+              },
             }
           );
         }
+
+        // If all half-slices returned empty but static lossless WAV workers captured speech, create fallback cues
+        const fallbackWindowSegments =
+          refinedWindowSegments.length > 0
+            ? refinedWindowSegments
+            : (() => {
+                const wavFallback = reconcileFocusedTranscripts(
+                  [
+                    { text: staticHqRes.text, isSmart: configSnapshot.mode === "SMART" },
+                    { text: staticRawRes.text, isSmart: contrastMode === "SMART" },
+                  ],
+                  lp.runId === runId ? lp.lockedScriptFamily : null
+                );
+                if (!wavFallback.text) return [];
+                const fbLang =
+                  (lp.runId === runId ? lp.lockedAutoLang : null) ??
+                  (configSnapshot.languageCode === "auto"
+                    ? undefined
+                    : configSnapshot.languageCode);
+                return splitTextIntoTimedCues(
+                  wavFallback.text,
+                  sliced.windowStartMs,
+                  Math.max(sliced.windowStartMs + 500, sliced.windowEndMs)
+                ).map((cue, cueIdx) => ({
+                  id: `seg_live_wav_${sliced.windowIndex}_${cueIdx}_${Date.now()}`,
+                  text: cue.text,
+                  speakerId: "spk_1",
+                  languageCode: fbLang,
+                  timestampMs: cue.startMs,
+                  endTimestampMs: cue.endMs,
+                  liveWindowIndex: sliced.windowIndex,
+                  isProvisional: true,
+                  isRefined: false,
+                }));
+              })();
 
         updateSessionById(targetSessionId, (s) => {
           let mergedLangs = s.detectedLanguages;
@@ -935,7 +1049,7 @@ export default function App() {
           }
 
           // Do not overwrite Worker 1's provisional stream with backward workers;
-          // wait for the 1-minute LM pass unless Worker 1 dropped with zero text.
+          // wait for the LM multimodal pass unless Worker 1 dropped with zero text.
           const hasWorker1OrEditedText = s.segments.some(
             (seg) =>
               seg.liveWindowIndex === sliced.windowIndex &&
@@ -948,7 +1062,7 @@ export default function App() {
                 windowIndex: sliced.windowIndex,
                 windowStartMs: sliced.windowStartMs,
                 windowEndMs: sliced.windowEndMs,
-                refinedSegments: refinedWindowSegments,
+                refinedSegments: fallbackWindowSegments,
               });
 
           return {
@@ -1180,6 +1294,8 @@ export default function App() {
     audioPlaybackEndedRef.current = false;
     isAudioPlayingRef.current = false;
     isPreBufferingRef.current = false;
+    segmentPlaybackCapMsRef.current = null;
+    setSegmentPlaybackCapMs(null);
     setUploadedAudio((prev) => {
       if (prev?.url) {
         URL.revokeObjectURL(prev.url);
@@ -1973,13 +2089,24 @@ export default function App() {
           isAudioEnded: false,
         });
 
-        const { totalDurationMs, chunks } = await sliceAudioFileIntoLiveChunks(
-          file,
-          15,
-          2048
-        );
+        const { totalDurationMs, chunks: rawChunks } =
+          await sliceAudioFileIntoLiveChunks(
+            file,
+            15,
+            2048,
+            SINGLE_SEGMENT_ONLY ? 1 : undefined
+          );
 
         if (abortController.signal.aborted) return;
+
+        const focusedLimit = getFocusedChunkLimit(rawChunks.length);
+        const chunks = rawChunks.slice(0, focusedLimit);
+        const segmentCapMs =
+          SINGLE_SEGMENT_ONLY && chunks[0]
+            ? Math.round(chunks[0].endSec * 1000)
+            : null;
+        segmentPlaybackCapMsRef.current = segmentCapMs;
+        setSegmentPlaybackCapMs(segmentCapMs);
 
         updateSessionById(newSession.id, (s) => ({
           ...s,
@@ -2244,6 +2371,7 @@ export default function App() {
                 const entry = uploadStructuredWindows.get(item.windowIndex);
                 if (entry) {
                   entry.lmRefined = true;
+                  entry.audioAttachment = undefined;
                 }
               }
 
@@ -2743,12 +2871,31 @@ export default function App() {
               return c;
             });
 
-            // Run all 5 focused workers TOGETHER on this single current 15s segment
-            const results = await Promise.all(
-              PASS_SPECS.map((spec, idx) =>
-                runSinglePassOnSegment(targetIdx, spec, passPreConns[idx])
-              )
-            );
+            // Run all 5 focused WS workers + 2 lossless static WAV workers TOGETHER on this single segment
+            const contrastMode: "VERBATIM" | "SMART" =
+              cfg.mode === "SMART" ? "VERBATIM" : "SMART";
+            const wavLangHint = lockedAutoLang ?? cfg.languageCode;
+            const [results, staticHqRes, staticRawRes] = await Promise.all([
+              Promise.all(
+                PASS_SPECS.map((spec, idx) =>
+                  runSinglePassOnSegment(targetIdx, spec, passPreConns[idx])
+                )
+              ),
+              transcribeWavWorker({
+                wavBase64: chunk.hqWavBase64,
+                languageCode: wavLangHint,
+                customVocabulary: cfg.customVocabulary,
+                mode: cfg.mode,
+                signal: abortController.signal,
+              }),
+              transcribeWavWorker({
+                wavBase64: chunk.rawWavBase64,
+                languageCode: wavLangHint,
+                customVocabulary: cfg.customVocabulary,
+                mode: contrastMode,
+                signal: abortController.signal,
+              }),
+            ]);
 
             if (abortController.signal.aborted) {
               activeChunksSet.delete(targetIdx);
@@ -2762,9 +2909,16 @@ export default function App() {
               setInterimText("");
             }
 
-            const fatal = results.find(
-              (r) => r.passError && isFatalConfigError(r.passError)
-            );
+            const fatal =
+              results.find(
+                (r) => r.passError && isFatalConfigError(r.passError)
+              ) ??
+              (staticHqRes.fatalError
+                ? { passError: staticHqRes.fatalError }
+                : undefined) ??
+              (staticRawRes.fatalError
+                ? { passError: staticRawRes.fatalError }
+                : undefined);
             if (fatal?.passError) {
               fatalError = fatal.passError;
               activeChunksSet.delete(targetIdx);
@@ -2772,21 +2926,30 @@ export default function App() {
               break;
             }
 
-            const allCompletedRatio = results.reduce(
-              (maxR, r) => Math.max(maxR, r.packetsRatio),
-              0
+            const hasStaticOutput = Boolean(
+              staticHqRes.text || staticRawRes.text
             );
-            const anyMostlyComplete = results.some(
-              (r) => r.streamedMostlyComplete
-            );
+            const allCompletedRatio = hasStaticOutput
+              ? 1
+              : results.reduce((maxR, r) => Math.max(maxR, r.packetsRatio), 0);
+            const anyMostlyComplete =
+              hasStaticOutput || results.some((r) => r.streamedMostlyComplete);
 
-            // Reconcile across all 5 workers on this current 15s segment
+            // Reconcile across all 7 independent ASR workers (5 WS + 2 lossless static WAV)
             let reconciled = reconcileFocusedTranscripts(
-              results.map((r) => ({
-                text: r.text,
-                lang: r.lang,
-                isSmart: r.isSmart,
-              })),
+              [
+                ...results.map((r) => ({
+                  text: r.text,
+                  lang: r.lang,
+                  isSmart: r.isSmart,
+                })),
+                ...(staticHqRes.text
+                  ? [{ text: staticHqRes.text, isSmart: cfg.mode === "SMART" }]
+                  : []),
+                ...(staticRawRes.text
+                  ? [{ text: staticRawRes.text, isSmart: contrastMode === "SMART" }]
+                  : []),
+              ],
               lockedScriptFamily
             );
 
@@ -2850,27 +3013,28 @@ export default function App() {
               }
             }
 
-            if (reconciled.text && !abortController.signal.aborted) {
-              rawChunkTexts[targetIdx] = reconciled.text;
-              rawChunkLangs[targetIdx] = reconciled.lang;
-              rawChunkComplete[targetIdx] = anyMostlyComplete;
-              rawChunkRatio[targetIdx] = allCompletedRatio;
+            const cStartMs = Math.round(
+              (anyMostlyComplete ? chunk.speechStartSec : chunk.startSec) * 1000
+            );
+            const cActualEndSec = anyMostlyComplete
+              ? chunk.speechEndSec
+              : Math.min(
+                  chunk.endSec,
+                  chunk.startSec +
+                    (chunk.endSec - chunk.startSec) * allCompletedRatio
+                );
+            const cEndMs = Math.max(
+              cStartMs + 600,
+              Math.round(cActualEndSec * 1000)
+            );
 
-              const cStartMs = Math.round(
-                (anyMostlyComplete ? chunk.speechStartSec : chunk.startSec) *
-                  1000
-              );
-              const cActualEndSec = anyMostlyComplete
-                ? chunk.speechEndSec
-                : Math.min(
-                    chunk.endSec,
-                    chunk.startSec +
-                      (chunk.endSec - chunk.startSec) * allCompletedRatio
-                  );
-              const cEndMs = Math.max(
-                cStartMs + 600,
-                Math.round(cActualEndSec * 1000)
-              );
+            if (!abortController.signal.aborted) {
+              if (reconciled.text) {
+                rawChunkTexts[targetIdx] = reconciled.text;
+                rawChunkLangs[targetIdx] = reconciled.lang;
+                rawChunkComplete[targetIdx] = anyMostlyComplete;
+                rawChunkRatio[targetIdx] = allCompletedRatio;
+              }
 
               upsertUploadWorkerObservations(
                 uploadStructuredWindows,
@@ -2883,20 +3047,36 @@ export default function App() {
                   worker2HqVerbatim: verifiedSupplement || (results[2]?.text ?? ""),
                   worker3HqSmart: results[3]?.text ?? "",
                   worker4HqClarified: results[4]?.text ?? "",
+                  staticHqWav: staticHqRes.text,
+                  staticRawWav: staticRawRes.text,
+                  audioAttachment: {
+                    hqWavBase64: chunk.hqWavBase64,
+                    rawWavBase64: chunk.rawWavBase64,
+                  },
                 }
               );
 
-              commitStitchedChunk(targetIdx);
-              if (
-                targetIdx + 1 < chunks.length &&
-                rawChunkTexts[targetIdx + 1]
-              ) {
-                commitStitchedChunk(targetIdx + 1);
+              if (reconciled.text) {
+                commitStitchedChunk(targetIdx);
+                if (
+                  targetIdx + 1 < chunks.length &&
+                  rawChunkTexts[targetIdx + 1]
+                ) {
+                  commitStitchedChunk(targetIdx + 1);
+                }
+              }
+
+              // Jointly run Multimodal Frontier LM right now with both audio WAVs + all 7 ASR hypotheses
+              // so Segment 0 starts playback already 100% refined
+              if (SINGLE_SEGMENT_ONLY || targetIdx === 0) {
+                await runUploadLmRefinementPass();
               }
             }
 
             const abnormalDropWithoutText =
               !reconciled.text &&
+              !staticHqRes.text &&
+              !staticRawRes.text &&
               results.some(
                 (r) =>
                   Boolean(r.passError) ||
@@ -2989,12 +3169,17 @@ export default function App() {
     if (isPreBufferingRef.current) return;
     const audio = audioElRef.current;
     if (!audio) return;
+    const cap = segmentPlaybackCapMsRef.current;
+    const clampedMs =
+      cap !== null && cap > 0
+        ? Math.max(0, Math.min(ms, cap))
+        : Math.max(0, ms);
     uploadSeekSeqRef.current += 1;
     audioPlaybackEndedRef.current = false;
     isPreBufferingRef.current = false;
     setInterimText("");
-    audio.currentTime = Math.max(0, ms / 1000);
-    setPlaybackTimeMs(ms);
+    audio.currentTime = clampedMs / 1000;
+    setPlaybackTimeMs(clampedMs);
     if (audio.paused) {
       isAudioPlayingRef.current = true;
       setIsAudioPlaying(true);
@@ -3006,6 +3191,35 @@ export default function App() {
         setIsAudioPlaying(false);
       });
     }
+  }, []);
+
+  const handleUploadedTimeUpdate = useCallback((ms: number) => {
+    const cap = segmentPlaybackCapMsRef.current;
+    if (cap !== null && cap > 0 && ms >= cap - 40) {
+      const audio = audioElRef.current;
+      if (audio && !audio.paused) {
+        audio.pause();
+        audio.currentTime = cap / 1000;
+      }
+      audioPlaybackEndedRef.current = true;
+      isAudioPlayingRef.current = false;
+      isPreBufferingRef.current = false;
+      setIsAudioPlaying(false);
+      setPlaybackTimeMs(cap);
+      setChunkProgress((prev) =>
+        prev
+          ? {
+              ...prev,
+              isBuffering: false,
+              isPaused: true,
+              isAudioEnded: true,
+              activeChunkIndices: [],
+            }
+          : prev
+      );
+      return;
+    }
+    setPlaybackTimeMs(ms);
   }, []);
 
   const handleStopAudio = useCallback(() => {
@@ -3051,10 +3265,16 @@ export default function App() {
       e.preventDefault();
       if (uploadedAudio?.sessionId === activeSessionId && audioElRef.current) {
         if (isPreBufferingRef.current) return;
-        if (audioElRef.current.paused) {
-          void audioElRef.current.play().catch(() => {});
+        const audio = audioElRef.current;
+        if (audio.paused) {
+          const cap = segmentPlaybackCapMsRef.current;
+          if (cap !== null && cap > 0 && audio.currentTime * 1000 >= cap - 150) {
+            audio.currentTime = 0;
+            setPlaybackTimeMs(0);
+          }
+          void audio.play().catch(() => {});
         } else {
-          audioElRef.current.pause();
+          audio.pause();
         }
         return;
       }
@@ -3444,9 +3664,10 @@ export default function App() {
                 interimText={interimText}
                 currentTimeMs={playbackTimeMs}
                 durationMs={uploadedAudio.durationMs || activeSession.durationMs}
+                maxPlaybackMs={segmentPlaybackCapMs}
                 isPlaying={isAudioPlaying}
                 chunkProgress={chunkProgress}
-                onTimeUpdate={setPlaybackTimeMs}
+                onTimeUpdate={handleUploadedTimeUpdate}
                 onDurationChange={(ms) =>
                   setUploadedAudio((prev) =>
                     prev ? { ...prev, durationMs: ms } : prev
@@ -3673,6 +3894,15 @@ export default function App() {
                       const audio = audioElRef.current;
                       if (!audio) return;
                       if (audio.paused) {
+                        const cap = segmentPlaybackCapMsRef.current;
+                        if (
+                          cap !== null &&
+                          cap > 0 &&
+                          audio.currentTime * 1000 >= cap - 150
+                        ) {
+                          audio.currentTime = 0;
+                          setPlaybackTimeMs(0);
+                        }
                         void audio.play();
                       } else {
                         audio.pause();

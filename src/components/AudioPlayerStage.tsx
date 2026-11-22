@@ -27,6 +27,7 @@ interface AudioPlayerStageProps {
   interimText?: string;
   currentTimeMs: number;
   durationMs: number;
+  maxPlaybackMs?: number | null;
   isPlaying: boolean;
   chunkProgress: UploadedChunkProgress | null;
   onTimeUpdate: (ms: number) => void;
@@ -45,6 +46,7 @@ export function AudioPlayerStage({
   interimText = "",
   currentTimeMs,
   durationMs,
+  maxPlaybackMs,
   isPlaying,
   chunkProgress,
   onTimeUpdate,
@@ -93,10 +95,23 @@ export function AudioPlayerStage({
   const showLiveInterimForCurrentChunk =
     interimText.trim().length > 0 && isStreamingThisChunk;
 
+  const effectiveLimitMs =
+    typeof maxPlaybackMs === "number" && maxPlaybackMs > 0
+      ? Math.min(maxPlaybackMs, durationMs || maxPlaybackMs)
+      : durationMs;
+
   const togglePlay = () => {
     const audio = audioRef.current;
     if (!audio) return;
     if (audio.paused) {
+      if (
+        typeof maxPlaybackMs === "number" &&
+        maxPlaybackMs > 0 &&
+        audio.currentTime * 1000 >= maxPlaybackMs - 150
+      ) {
+        audio.currentTime = 0;
+        onTimeUpdate(0);
+      }
       void audio.play();
     } else {
       audio.pause();
@@ -106,12 +121,10 @@ export function AudioPlayerStage({
   const skipBy = (deltaSec: number) => {
     const audio = audioRef.current;
     if (!audio) return;
+    const rawLimit = effectiveLimitMs || audio.duration * 1000;
     const nextMs = Math.max(
       0,
-      Math.min(
-        durationMs || audio.duration * 1000,
-        (audio.currentTime + deltaSec) * 1000
-      )
+      Math.min(rawLimit, (audio.currentTime + deltaSec) * 1000)
     );
     onSeekToMs(nextMs);
   };

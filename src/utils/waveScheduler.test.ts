@@ -2,15 +2,22 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   MAX_WAVES,
+  SINGLE_SEGMENT_ONLY,
   WORKERS_PER_WAVE,
+  getFocusedChunkLimit,
   getWaveCount,
   pickNextWaveSegment,
   shouldInterruptWaveOnSeek,
 } from "./waveScheduler";
 
-test("getWaveCount focuses strictly on 1 current segment wave with 5 parallel workers", () => {
+test("getWaveCount focuses strictly on 1 current segment wave with 5 parallel workers and single-segment isolation", () => {
   assert.equal(WORKERS_PER_WAVE, 5);
   assert.equal(MAX_WAVES, 1);
+  assert.equal(SINGLE_SEGMENT_ONLY, true);
+  assert.equal(getFocusedChunkLimit(0), 0);
+  assert.equal(getFocusedChunkLimit(1), 1);
+  assert.equal(getFocusedChunkLimit(8), 1);
+  assert.equal(getFocusedChunkLimit(8, false), 8);
   assert.equal(getWaveCount(0), 0);
   assert.equal(getWaveCount(1), 1);
   assert.equal(getWaveCount(2), 1);

@@ -1,5 +1,6 @@
 export const WORKERS_PER_WAVE = 5;
 export const MAX_WAVES = 1;
+export const SINGLE_SEGMENT_ONLY = true;
 
 export interface WaveScheduleParams {
   totalChunks: number;
@@ -9,6 +10,14 @@ export interface WaveScheduleParams {
   isPlaying: boolean;
   isAudioEnded: boolean;
   playheadChunkIdx: number;
+}
+
+export function getFocusedChunkLimit(
+  totalChunks: number,
+  singleSegmentOnly = SINGLE_SEGMENT_ONLY
+): number {
+  if (totalChunks <= 0) return 0;
+  return singleSegmentOnly ? 1 : totalChunks;
 }
 
 export function getWaveCount(totalChunks: number): number {

@@ -13,6 +13,13 @@ export interface StructuredWorkerOutputs {
   worker3FirstHalfContrast: string;
   worker4SecondHalfPrimary: string;
   worker5SecondHalfContrast: string;
+  worker7StaticHqWav?: string;
+  worker8StaticRawWav?: string;
+}
+
+export interface WindowAudioAttachment {
+  hqWavBase64?: string;
+  rawWavBase64?: string;
 }
 
 export interface StructuredWorkerWindow {
@@ -20,6 +27,7 @@ export interface StructuredWorkerWindow {
   startMs: number;
   endMs: number;
   workers: StructuredWorkerOutputs;
+  audioAttachment?: WindowAudioAttachment;
   backwardDone: boolean;
   lmRefined: boolean;
 }
@@ -38,6 +46,8 @@ function emptyWorkerOutputs(): StructuredWorkerOutputs {
     worker3FirstHalfContrast: "",
     worker4SecondHalfPrimary: "",
     worker5SecondHalfContrast: "",
+    worker7StaticHqWav: "",
+    worker8StaticRawWav: "",
   };
 }
 
@@ -135,6 +145,9 @@ export function upsertBackwardWorkerObservations(
     firstHalfContrast?: string;
     secondHalfPrimary?: string;
     secondHalfContrast?: string;
+    staticHqWav?: string;
+    staticRawWav?: string;
+    audioAttachment?: WindowAudioAttachment;
   }
 ): StructuredWorkerWindow {
   let entry = windows.get(windowIndex);
@@ -165,14 +178,27 @@ export function upsertBackwardWorkerObservations(
   entry.workers.worker5SecondHalfContrast = cleanTranscriptArtifacts(
     outputs.secondHalfContrast ?? entry.workers.worker5SecondHalfContrast
   );
+  if (outputs.staticHqWav !== undefined) {
+    entry.workers.worker7StaticHqWav = cleanTranscriptArtifacts(
+      outputs.staticHqWav
+    );
+  }
+  if (outputs.staticRawWav !== undefined) {
+    entry.workers.worker8StaticRawWav = cleanTranscriptArtifacts(
+      outputs.staticRawWav
+    );
+  }
+  if (outputs.audioAttachment) {
+    entry.audioAttachment = outputs.audioAttachment;
+  }
   entry.backwardDone = true;
 
   return entry;
 }
 
 /**
- * Records all 5 focused parallel worker outputs for an uploaded 15s segment
- * without allowing any worker to overwrite another prior to LM synthesis.
+ * Records all focused parallel WebSocket + lossless static WAV worker outputs
+ * for an uploaded segment without allowing any worker to overwrite another prior to LM synthesis.
  */
 export function upsertUploadWorkerObservations(
   windows: Map<number, StructuredWorkerWindow>,
@@ -185,6 +211,9 @@ export function upsertUploadWorkerObservations(
     worker2HqVerbatim?: string;
     worker3HqSmart?: string;
     worker4HqClarified?: string;
+    staticHqWav?: string;
+    staticRawWav?: string;
+    audioAttachment?: WindowAudioAttachment;
   }
 ): StructuredWorkerWindow {
   let entry = windows.get(chunkIndex);
@@ -218,6 +247,19 @@ export function upsertUploadWorkerObservations(
   entry.workers.worker5SecondHalfContrast = cleanTranscriptArtifacts(
     outputs.worker4HqClarified ?? entry.workers.worker5SecondHalfContrast
   );
+  if (outputs.staticHqWav !== undefined) {
+    entry.workers.worker7StaticHqWav = cleanTranscriptArtifacts(
+      outputs.staticHqWav
+    );
+  }
+  if (outputs.staticRawWav !== undefined) {
+    entry.workers.worker8StaticRawWav = cleanTranscriptArtifacts(
+      outputs.staticRawWav
+    );
+  }
+  if (outputs.audioAttachment) {
+    entry.audioAttachment = outputs.audioAttachment;
+  }
   entry.backwardDone = true;
 
   return entry;
@@ -231,12 +273,16 @@ export function hasAnyWorkerOutput(entry: StructuredWorkerWindow): boolean {
       w.worker2FirstHalfPrimary ||
       w.worker3FirstHalfContrast ||
       w.worker4SecondHalfPrimary ||
-      w.worker5SecondHalfContrast
+      w.worker5SecondHalfContrast ||
+      w.worker7StaticHqWav ||
+      w.worker8StaticRawWav ||
+      entry.audioAttachment?.hqWavBase64 ||
+      entry.audioAttachment?.rawWavBase64
   );
 }
 
 /**
- * Collects windows that have completed all 5 workers and await the 1-minute LM pass.
+ * Collects windows that have completed all workers and await the LM pass.
  */
 export function collectDueRefinementWindows(
   windows: Map<number, StructuredWorkerWindow>
@@ -247,6 +293,9 @@ export function collectDueRefinementWindows(
       due.push({
         ...entry,
         workers: { ...entry.workers },
+        ...(entry.audioAttachment
+          ? { audioAttachment: { ...entry.audioAttachment } }
+          : {}),
       });
     }
   }

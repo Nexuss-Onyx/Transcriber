@@ -1,6 +1,7 @@
 import type { TranscriptSegment } from "../types/transcribe";
 import {
   applySpeechHighPassFilter,
+  encodeFloat32ToWavBase64,
   float32ToBase64Pcm16,
   normalizeSpeechDynamics,
 } from "./audioCapture";
@@ -28,6 +29,8 @@ export interface SlicedLiveWindow {
   hasAudioSignal: boolean;
   halves: LiveHalfSlice[];
   tailSamples: Float32Array;
+  hqWavBase64: string;
+  rawWavBase64: string;
 }
 
 export function concatFloat32Arrays(chunks: Float32Array[]): Float32Array {
@@ -291,6 +294,13 @@ export function sliceLiveWindowIntoHalves(params: {
     });
   }
 
+  const hqWavBase64 = windowHasSignal
+    ? encodeFloat32ToWavBase64(normalizeSpeechDynamics(combinedFiltered), sampleRate)
+    : "";
+  const rawWavBase64 = windowHasSignal
+    ? encodeFloat32ToWavBase64(combinedRaw, sampleRate)
+    : "";
+
   return {
     windowIndex,
     windowStartMs,
@@ -298,6 +308,8 @@ export function sliceLiveWindowIntoHalves(params: {
     hasAudioSignal: windowHasSignal,
     halves,
     tailSamples,
+    hqWavBase64,
+    rawWavBase64,
   };
 }
 

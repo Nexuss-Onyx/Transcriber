@@ -72,6 +72,16 @@ test("sliceLiveWindowIntoHalves splits 10s window into first 5s and later 5s sli
   assert.ok(later5s.pcmPacketsBase64.length > 30);
   assert.ok(later5s.rawPacketsBase64.length > 30);
   assert.equal(sliced.tailSamples.length, 8000);
+  assert.ok(sliced.hqWavBase64.length > 1000);
+  assert.ok(sliced.rawWavBase64.length > 1000);
+  assert.equal(
+    Buffer.from(sliced.hqWavBase64, "base64").subarray(0, 4).toString("ascii"),
+    "RIFF"
+  );
+  assert.equal(
+    Buffer.from(sliced.rawWavBase64, "base64").subarray(0, 4).toString("ascii"),
+    "RIFF"
+  );
 });
 
 test("sliceLiveWindowIntoHalves detects pure silence accurately", () => {
@@ -85,6 +95,8 @@ test("sliceLiveWindowIntoHalves detects pure silence accurately", () => {
   assert.equal(sliced.hasAudioSignal, false);
   assert.equal(sliced.halves[0].hasAudioSignal, false);
   assert.equal(sliced.halves[0].pcmPacketsBase64.length, 0);
+  assert.equal(sliced.hqWavBase64, "");
+  assert.equal(sliced.rawWavBase64, "");
 });
 
 test("mergeWindowRefinedSegments replaces unedited provisional drafts while keeping edited & other windows", () => {

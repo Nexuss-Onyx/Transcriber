@@ -208,7 +208,7 @@ test("applyLmRefinedChunksToSegments updates uploaded chunks by chunkIndex while
   );
 });
 
-test("upsertLiveHqWorkerObservation and upsertUploadWorkerObservations preserve all 6 live and 5 upload workers independently", async () => {
+test("upsertLiveHqWorkerObservation and upsertUploadWorkerObservations preserve all 8 live and 7 upload workers + WAV attachments independently", async () => {
   const { upsertLiveHqWorkerObservation, upsertUploadWorkerObservations } =
     await import("./structuredRefine");
   const liveMap = new Map<number, StructuredWorkerWindow>();
@@ -219,12 +219,18 @@ test("upsertLiveHqWorkerObservation and upsertUploadWorkerObservations preserve 
     firstHalfContrast: "half1 raw",
     secondHalfPrimary: "half2 hq",
     secondHalfContrast: "half2 raw",
+    staticHqWav: "static hq live",
+    staticRawWav: "static raw live",
+    audioAttachment: { hqWavBase64: "UklGRg==", rawWavBase64: "UklGRh==" },
   });
   const liveEntry = liveMap.get(0)!;
   assert.equal(liveEntry.workers.worker1LiveRealtime, "raw one");
   assert.equal(liveEntry.workers.worker6LiveHqRealtime, "hq conditioned one");
   assert.equal(liveEntry.workers.worker2FirstHalfPrimary, "half1 hq");
   assert.equal(liveEntry.workers.worker5SecondHalfContrast, "half2 raw");
+  assert.equal(liveEntry.workers.worker7StaticHqWav, "static hq live");
+  assert.equal(liveEntry.workers.worker8StaticRawWav, "static raw live");
+  assert.equal(liveEntry.audioAttachment?.hqWavBase64, "UklGRg==");
 
   const upMap = new Map<number, StructuredWorkerWindow>();
   upsertUploadWorkerObservations(upMap, 0, 0, 15_000, {
@@ -233,6 +239,9 @@ test("upsertLiveHqWorkerObservation and upsertUploadWorkerObservations preserve 
     worker2HqVerbatim: "hq verbatim",
     worker3HqSmart: "hq smart",
     worker4HqClarified: "hq clarified",
+    staticHqWav: "static hq upload",
+    staticRawWav: "static raw upload",
+    audioAttachment: { hqWavBase64: "UklGRq==", rawWavBase64: "UklGRr==" },
   });
   const upEntry = upMap.get(0)!;
   assert.equal(upEntry.workers.worker1LiveRealtime, "raw primary");
@@ -240,4 +249,9 @@ test("upsertLiveHqWorkerObservation and upsertUploadWorkerObservations preserve 
   assert.equal(upEntry.workers.worker3FirstHalfContrast, "hq verbatim");
   assert.equal(upEntry.workers.worker4SecondHalfPrimary, "hq smart");
   assert.equal(upEntry.workers.worker5SecondHalfContrast, "hq clarified");
+  assert.equal(upEntry.workers.worker7StaticHqWav, "static hq upload");
+  assert.equal(upEntry.workers.worker8StaticRawWav, "static raw upload");
+  const due = collectDueRefinementWindows(upMap);
+  assert.equal(due.length, 1);
+  assert.equal(due[0].audioAttachment?.rawWavBase64, "UklGRr==");
 });
