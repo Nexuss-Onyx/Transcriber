@@ -1,6 +1,8 @@
 import { useEffect, useState, type RefObject } from "react";
 import {
   Captions,
+  FileAudio,
+  Gauge,
   Loader2,
   Pause,
   Play,
@@ -132,48 +134,9 @@ export function AudioPlayerStage({
     !chunkProgress?.isPaused;
 
   const isBuffering = Boolean(chunkProgress?.isBuffering);
-  const activeIndices = chunkProgress?.activeChunkIndices ?? [];
-  const hasActiveSegment = activeIndices.length > 0;
-  const activeSegLabel = activeIndices.map((i) => i + 1).join(" & ");
-  const totalWaves = chunkProgress?.waveCount ?? (activeIndices.length > 1 ? 2 : 1);
-  const totalWorkers = chunkProgress?.workerCount ?? totalWaves * 3;
-  const readyWorkers = chunkProgress?.readyWorkers ?? 0;
-  const preRollStage = chunkProgress?.preRollStage ?? "transcribing";
-
-  const activeWorkerSummary =
-    activeIndices.length > 1
-      ? `${totalWaves} waves (${totalWorkers} workers) on segments ${activeSegLabel}`
-      : `3 workers on segment ${activeSegLabel}`;
-
-  const statusText = !chunkProgress
-    ? ""
-    : isBuffering
-      ? preRollStage === "segmenting"
-        ? "Segmenting audio into 15s clips..."
-        : preRollStage === "connecting"
-          ? `Transcribing · Readying ${totalWaves} waves (${readyWorkers}/${totalWorkers} workers)...`
-          : totalWaves > 1
-            ? `2 waves focusing on segments 1 & 2 (${readyWorkers}/${totalWorkers} workers ready)`
-            : `Focusing on segment 1 (${readyWorkers}/${totalWorkers} workers ready)`
-      : chunkProgress.completedChunks >= chunkProgress.totalChunks &&
-          chunkProgress.totalChunks > 0
-        ? `${chunkProgress.completedChunks}/${chunkProgress.totalChunks} segments (15s) · Complete`
-        : isPlaying
-          ? `${chunkProgress.completedChunks}/${chunkProgress.totalChunks} segments (15s) · ${
-              hasActiveSegment ? activeWorkerSummary : "Synced"
-            }`
-          : isCompletingAfterEnd
-            ? `${chunkProgress.completedChunks}/${chunkProgress.totalChunks} segments (15s) · ${
-                hasActiveSegment
-                  ? activeIndices.length > 1
-                    ? `${totalWaves} waves finishing segments ${activeSegLabel}`
-                    : `3 workers finishing segment ${activeSegLabel}`
-                  : "Completing..."
-              }`
-            : `${chunkProgress.completedChunks}/${chunkProgress.totalChunks} segments (15s) · Paused`;
 
   return (
-    <div className="shrink-0 border-b border-slate-200 bg-slate-950 text-slate-100 dark:border-slate-800">
+    <div className="shrink-0 border-b border-slate-200/70 bg-slate-100/70 px-4 py-3 backdrop-blur-xl dark:border-white/10 dark:bg-[#061028]/70 sm:px-6">
       <audio
         ref={audioRef}
         src={audioUrl}
@@ -190,256 +153,195 @@ export function AudioPlayerStage({
         onEnded={() => onPlayStateChange(false, true)}
       />
 
-      <div className="mx-auto max-w-3xl px-4 py-3 sm:px-8">
-        {/* Header strip */}
-        <div className="mb-2.5 flex items-center justify-between gap-4 text-xs">
-          <div className="flex min-w-0 items-center gap-2">
-            <span className="truncate font-medium text-slate-200">
-              {fileName}
-            </span>
-            {chunkProgress && (
-              <>
-                <span aria-hidden="true" className="text-slate-600">
-                  ·
-                </span>
-                <span className="flex items-center gap-1.5 text-slate-400 tabular-nums whitespace-nowrap shrink-0">
-                  {(isPlaying || isCompletingAfterEnd || isBuffering) &&
-                    chunkProgress.isProcessing && (
-                      <Loader2 className="h-3 w-3 animate-spin text-rose-400" />
-                    )}
-                  <span>{statusText}</span>
-                </span>
-              </>
+      {/* Top minimal row: file icon + status loader + close icon */}
+      <div className="mb-2 flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2 text-slate-500 dark:text-slate-300">
+          <span title={fileName} aria-label={fileName}>
+            <FileAudio className="h-4 w-4 text-sky-500 dark:text-sky-400" />
+          </span>
+          {(isPlaying || isCompletingAfterEnd || isBuffering) &&
+            chunkProgress?.isProcessing && (
+              <Loader2 className="h-3.5 w-3.5 animate-spin text-sky-400" />
             )}
-          </div>
-          <button
-            type="button"
-            onClick={onCloseAudio}
-            aria-label="Detach audio player"
-            className="flex h-7 w-7 shrink-0 items-center justify-center rounded text-slate-400 hover:bg-slate-800 hover:text-slate-100"
-          >
-            <X className="h-3.5 w-3.5" />
-          </button>
+          <span className="font-mono text-[11px] tabular-nums opacity-75">
+            {formatDuration(currentTimeMs)} / {formatDuration(durationMs)}
+          </span>
         </div>
 
-        {/* YouTube-style Live Caption Box */}
-        {showCaptions && (
-          <div className="mb-3 flex min-h-[68px] items-center justify-center rounded-lg border border-slate-800 bg-slate-900/90 px-5 py-3 text-center">
-            {isBuffering && chunkProgress ? (
-              <div className="flex items-center gap-2.5 text-xs text-slate-200">
-                <Loader2 className="h-4 w-4 animate-spin text-rose-400" />
-                <span>
-                  {preRollStage === "segmenting"
-                    ? "Transcribing · Segmenting audio into 15-second clips..."
-                    : preRollStage === "connecting"
-                      ? `Transcribing · Preparing ${totalWaves} waves (${readyWorkers}/${totalWorkers} Live workers ready)...`
-                      : totalWaves > 1
-                        ? `Transcribing segments 1 & 2 simultaneously (${readyWorkers}/${totalWorkers} workers active) · Playback opens when segment 1 is ready...`
-                        : `Transcribing first 15s segment (${readyWorkers}/${totalWorkers} workers active) · Audio will start automatically when ready...`}
-                </span>
-              </div>
-            ) : activeSegment ? (
-              <p className="max-w-2xl text-base font-medium leading-snug text-white sm:text-[17px]">
-                <span className="rounded bg-black/75 px-2.5 py-1 box-decoration-clone">
-                  {activeSegment.text}
-                </span>
+        <button
+          type="button"
+          onClick={onCloseAudio}
+          aria-label="Detach audio player"
+          title="Close audio player"
+          className="flex h-8 w-8 items-center justify-center rounded-full text-slate-400 transition-colors hover:bg-slate-200/70 hover:text-slate-800 dark:hover:bg-white/10 dark:hover:text-white"
+        >
+          <X className="h-3.5 w-3.5" />
+        </button>
+      </div>
+
+      {/* Live spoken captions stage (shows only real transcribed words or calm loader) */}
+      {showCaptions &&
+        (activeSegment ||
+          showLiveInterimForCurrentChunk ||
+          isBuffering ||
+          (!isCurrentChunkDone && isPlaying) ||
+          isCompletingAfterEnd) && (
+          <div className="mb-2.5 flex min-h-[52px] items-center justify-center rounded-2xl border border-slate-200/70 bg-white/60 px-4 py-2 text-center dark:border-white/10 dark:bg-[#040a1a]/75">
+            {activeSegment ? (
+              <p className="text-[15px] font-medium leading-snug text-slate-900 dark:text-white">
+                {activeSegment.text}
               </p>
             ) : showLiveInterimForCurrentChunk ? (
-              <p className="max-w-2xl text-base font-medium leading-snug text-slate-200 sm:text-[17px]">
-                <span className="rounded bg-black/65 px-2.5 py-1 box-decoration-clone">
-                  {interimText.trim()}
-                </span>
-              </p>
-            ) : !isCurrentChunkDone && isPlaying ? (
-              <div className="flex items-center gap-2 text-xs text-slate-400">
-                <Loader2 className="h-3.5 w-3.5 animate-spin text-rose-400" />
-                <span>
-                  Transcribing live ({formatDuration(activeChunkIndex * 15000)}{" "}
-                  – {formatDuration((activeChunkIndex + 1) * 15000)})...
-                </span>
-              </div>
-            ) : isCompletingAfterEnd && chunkProgress ? (
-              <div className="flex items-center gap-2 text-xs text-slate-300">
-                <Loader2 className="h-3.5 w-3.5 animate-spin text-emerald-400" />
-                <span>
-                  Audio finished · Completing remaining 15s segments (
-                  {chunkProgress.completedChunks}/{chunkProgress.totalChunks})...
-                </span>
-              </div>
-            ) : !isPlaying && !isCurrentChunkDone ? (
-              <p className="text-xs text-slate-400">
-                Paused at {formatDuration(currentTimeMs)} · Press Play to
-                continue audio and live transcription together
+              <p className="text-[15px] font-medium leading-snug text-slate-700 dark:text-slate-200">
+                {interimText.trim()}
               </p>
             ) : (
-              <p className="text-xs text-slate-500">
-                No speech detected at {formatDuration(currentTimeMs)}
-              </p>
+              <Loader2 className="h-4 w-4 animate-spin text-sky-400" />
             )}
           </div>
         )}
 
-        {/* Scrubber with distinct 15-second completed segment blocks + playhead */}
-        <div className="group relative mb-2.5">
-          <div
-            onClick={(e) => {
-              if (isBuffering) return;
-              const rect = e.currentTarget.getBoundingClientRect();
-              const ratio = Math.max(
-                0,
-                Math.min(1, (e.clientX - rect.left) / rect.width)
+      {/* Scrubber with 15s segment completion indicators */}
+      <div className="mb-2.5">
+        <div
+          onClick={(e) => {
+            if (isBuffering) return;
+            const rect = e.currentTarget.getBoundingClientRect();
+            const ratio = Math.max(
+              0,
+              Math.min(1, (e.clientX - rect.left) / rect.width)
+            );
+            onSeekToMs(Math.round(ratio * safeDuration));
+          }}
+          className={`relative h-2 w-full overflow-hidden rounded-full bg-slate-300/70 dark:bg-white/10 ${
+            isBuffering ? "cursor-not-allowed opacity-70" : "cursor-pointer"
+          }`}
+        >
+          {chunkProgress &&
+            chunkProgress.totalChunks > 0 &&
+            chunkProgress.activeChunkIndices.map((idx) => {
+              if (completedSet.has(idx)) return null;
+              const startPct = (idx / chunkProgress.totalChunks) * 100;
+              const widthPct = (1 / chunkProgress.totalChunks) * 100;
+              return (
+                <div
+                  key={`active-${idx}`}
+                  style={{ left: `${startPct}%`, width: `${widthPct}%` }}
+                  className="absolute top-0 h-1 bg-sky-400/80 animate-pulse"
+                />
               );
-              onSeekToMs(Math.round(ratio * safeDuration));
-            }}
-            className={`relative h-2.5 w-full overflow-hidden rounded-full bg-slate-800 ${
-              isBuffering ? "cursor-not-allowed opacity-75" : "cursor-pointer"
-            }`}
+            })}
+
+          {chunkProgress &&
+            chunkProgress.totalChunks > 0 &&
+            chunkProgress.completedChunkIndices.map((idx) => {
+              const startPct = (idx / chunkProgress.totalChunks) * 100;
+              const widthPct = (1 / chunkProgress.totalChunks) * 100;
+              return (
+                <div
+                  key={idx}
+                  style={{ left: `${startPct}%`, width: `${widthPct}%` }}
+                  className="absolute top-0 h-1 bg-emerald-400/85"
+                />
+              );
+            })}
+
+          <div
+            className="absolute bottom-0 left-0 h-1 bg-sky-400 transition-[width] duration-100"
+            style={{ width: `${progressPct}%` }}
+          />
+          <div
+            className="absolute inset-y-0 w-0.5 bg-white transition-[left] duration-100"
+            style={{ left: `calc(${progressPct}% - 1px)` }}
+          />
+        </div>
+      </div>
+
+      {/* Icon-only audio transport row */}
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-1.5">
+          <button
+            type="button"
+            disabled={isBuffering}
+            onClick={togglePlay}
+            aria-label={isPlaying ? "Pause audio" : "Play audio"}
+            title={isPlaying ? "Pause" : "Play"}
+            className="flex h-8 w-8 items-center justify-center rounded-full bg-sky-500 text-white transition-colors hover:bg-sky-400 disabled:cursor-not-allowed disabled:opacity-45"
           >
-            {/* Active 15s chunk blocks currently being transcribed by live workers */}
-            {chunkProgress &&
-              chunkProgress.totalChunks > 0 &&
-              chunkProgress.activeChunkIndices.map((idx) => {
-                if (completedSet.has(idx)) return null;
-                const startPct = (idx / chunkProgress.totalChunks) * 100;
-                const widthPct = (1 / chunkProgress.totalChunks) * 100;
-                return (
-                  <div
-                    key={`active-${idx}`}
-                    style={{ left: `${startPct}%`, width: `${widthPct}%` }}
-                    className="absolute top-0 h-1.5 bg-amber-400/85 animate-pulse"
-                  />
-                );
-              })}
-
-            {/* Completed 15s chunk blocks (upper band, always visible even at 100% playhead) */}
-            {chunkProgress &&
-              chunkProgress.totalChunks > 0 &&
-              chunkProgress.completedChunkIndices.map((idx) => {
-                const startPct = (idx / chunkProgress.totalChunks) * 100;
-                const widthPct = (1 / chunkProgress.totalChunks) * 100;
-                return (
-                  <div
-                    key={idx}
-                    style={{ left: `${startPct}%`, width: `${widthPct}%` }}
-                    className="absolute top-0 h-1.5 bg-emerald-500/85"
-                  />
-                );
-              })}
-
-            {/* Active playhead bar (bottom track) */}
-            <div
-              className="absolute bottom-0 left-0 h-1 bg-rose-500 transition-[width] duration-100"
-              style={{ width: `${progressPct}%` }}
-            />
-
-            {/* Crisp playhead cursor needle */}
-            <div
-              className="absolute inset-y-0 w-0.5 bg-white shadow-xs transition-[left] duration-100"
-              style={{ left: `calc(${progressPct}% - 1px)` }}
-            />
-
-            {/* 15s segment tick dividers */}
-            {chunkProgress &&
-              chunkProgress.totalChunks > 1 &&
-              Array.from({ length: chunkProgress.totalChunks - 1 }).map(
-                (_, idx) => {
-                  const tickPct = ((idx + 1) / chunkProgress.totalChunks) * 100;
-                  return (
-                    <div
-                      key={idx}
-                      style={{ left: `${tickPct}%` }}
-                      className="absolute inset-y-0 w-px bg-slate-950/90"
-                    />
-                  );
-                }
-              )}
-          </div>
+            {isPlaying ? (
+              <Pause className="h-3.5 w-3.5 fill-current" />
+            ) : (
+              <Play className="h-3.5 w-3.5 translate-x-[0.5px] fill-current" />
+            )}
+          </button>
+          <button
+            type="button"
+            disabled={isBuffering}
+            onClick={onStopAudio}
+            aria-label="Stop audio"
+            title="Stop"
+            className="flex h-8 w-8 items-center justify-center rounded-full border border-slate-300/70 text-slate-600 transition-colors hover:bg-slate-200/70 disabled:cursor-not-allowed disabled:opacity-45 dark:border-white/15 dark:text-slate-200 dark:hover:bg-white/10"
+          >
+            <Square className="h-3 w-3 fill-current" />
+          </button>
+          <button
+            type="button"
+            disabled={isBuffering}
+            onClick={() => skipBy(-5)}
+            aria-label="Back 5 seconds"
+            title="Back 5s"
+            className="flex h-8 w-8 items-center justify-center rounded-full text-slate-500 hover:bg-slate-200/70 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-45 dark:text-slate-300 dark:hover:bg-white/10 dark:hover:text-white"
+          >
+            <RotateCcw className="h-3.5 w-3.5" />
+          </button>
+          <button
+            type="button"
+            disabled={isBuffering}
+            onClick={() => skipBy(15)}
+            aria-label="Forward 15 seconds"
+            title="Forward 15s"
+            className="flex h-8 w-8 items-center justify-center rounded-full text-slate-500 hover:bg-slate-200/70 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-45 dark:text-slate-300 dark:hover:bg-white/10 dark:hover:text-white"
+          >
+            <RotateCw className="h-3.5 w-3.5" />
+          </button>
+          <button
+            type="button"
+            onClick={() => setIsMuted((m) => !m)}
+            aria-label={isMuted ? "Unmute" : "Mute"}
+            title={isMuted ? "Unmute" : "Mute"}
+            className="flex h-8 w-8 items-center justify-center rounded-full text-slate-500 hover:bg-slate-200/70 hover:text-slate-900 dark:text-slate-300 dark:hover:bg-white/10 dark:hover:text-white"
+          >
+            {isMuted ? (
+              <VolumeX className="h-3.5 w-3.5" />
+            ) : (
+              <Volume2 className="h-3.5 w-3.5" />
+            )}
+          </button>
         </div>
 
-        {/* Transport Controls */}
-        <div className="flex items-center justify-between gap-3">
-          <div className="flex items-center gap-1.5">
-            <button
-              type="button"
-              disabled={isBuffering}
-              onClick={togglePlay}
-              aria-label={isPlaying ? "Pause audio and transcription" : "Play audio and transcription"}
-              className="flex h-8 w-8 items-center justify-center rounded-md bg-white text-slate-950 transition-colors hover:bg-slate-200 disabled:cursor-not-allowed disabled:opacity-45"
-            >
-              {isPlaying ? (
-                <Pause className="h-4 w-4 fill-current" />
-              ) : (
-                <Play className="h-4 w-4 translate-x-[1px] fill-current" />
-              )}
-            </button>
-            <button
-              type="button"
-              disabled={isBuffering}
-              onClick={onStopAudio}
-              aria-label="Stop audio and transcription"
-              className="flex h-8 w-8 items-center justify-center rounded-md bg-slate-800 text-slate-200 transition-colors hover:bg-slate-700 hover:text-white disabled:cursor-not-allowed disabled:opacity-45"
-            >
-              <Square className="h-3.5 w-3.5 fill-current" />
-            </button>
-            <button
-              type="button"
-              disabled={isBuffering}
-              onClick={() => skipBy(-5)}
-              aria-label="Back 5 seconds"
-              className="flex h-8 items-center gap-1 rounded-md px-2 text-xs text-slate-300 hover:bg-slate-800 hover:text-white disabled:cursor-not-allowed disabled:opacity-45"
-            >
-              <RotateCcw className="h-3.5 w-3.5" />
-              <span>5s</span>
-            </button>
-            <button
-              type="button"
-              disabled={isBuffering}
-              onClick={() => skipBy(15)}
-              aria-label="Forward 15 seconds"
-              className="flex h-8 items-center gap-1 rounded-md px-2 text-xs text-slate-300 hover:bg-slate-800 hover:text-white disabled:cursor-not-allowed disabled:opacity-45"
-            >
-              <RotateCw className="h-3.5 w-3.5" />
-              <span>15s</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => setIsMuted((m) => !m)}
-              aria-label={isMuted ? "Unmute" : "Mute"}
-              className="flex h-8 w-8 items-center justify-center rounded-md text-slate-300 hover:bg-slate-800 hover:text-white"
-            >
-              {isMuted ? (
-                <VolumeX className="h-4 w-4" />
-              ) : (
-                <Volume2 className="h-4 w-4" />
-              )}
-            </button>
-            <span className="ml-1 font-mono text-xs text-slate-400 tabular-nums">
-              {formatDuration(currentTimeMs)} / {formatDuration(durationMs)}
-            </span>
-          </div>
-
-          <div className="flex items-center gap-1.5">
-            <button
-              type="button"
-              onClick={cycleSpeed}
-              className="h-8 rounded-md px-2.5 font-mono text-xs text-slate-300 hover:bg-slate-800 hover:text-white tabular-nums whitespace-nowrap shrink-0"
-            >
-              {playbackRate}x
-            </button>
-            <button
-              type="button"
-              onClick={() => setShowCaptions((c) => !c)}
-              aria-label="Toggle live captions"
-              className={`flex h-8 items-center gap-1.5 rounded-md px-2.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
-                showCaptions
-                  ? "bg-slate-800 text-rose-400"
-                  : "text-slate-400 hover:bg-slate-800 hover:text-white"
-              }`}
-            >
-              <Captions className="h-4 w-4" />
-              <span>CC</span>
-            </button>
-          </div>
+        <div className="flex items-center gap-1.5">
+          <button
+            type="button"
+            onClick={cycleSpeed}
+            aria-label={`Playback speed ${playbackRate}x`}
+            title={`Speed (${playbackRate}x)`}
+            className="flex h-8 w-8 items-center justify-center rounded-full text-slate-500 hover:bg-slate-200/70 hover:text-slate-900 dark:text-slate-300 dark:hover:bg-white/10 dark:hover:text-white"
+          >
+            <Gauge className="h-3.5 w-3.5" />
+          </button>
+          <button
+            type="button"
+            onClick={() => setShowCaptions((c) => !c)}
+            aria-label="Toggle live captions"
+            title="Toggle captions"
+            className={`flex h-8 w-8 items-center justify-center rounded-full transition-colors ${
+              showCaptions
+                ? "bg-sky-500/20 text-sky-400"
+                : "text-slate-400 hover:bg-slate-200/70 dark:hover:bg-white/10"
+            }`}
+          >
+            <Captions className="h-4 w-4" />
+          </button>
         </div>
       </div>
     </div>

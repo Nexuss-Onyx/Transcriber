@@ -1,16 +1,27 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
+  AudioLines,
+  AudioWaveform,
   Check,
   Copy,
   Download,
-  Menu,
+  FileAudio,
+  FileCode,
+  FileJson,
+  FileText,
+  Loader2,
   Mic,
   Moon,
+  PanelLeft,
   Pause,
   Play,
+  Plus,
   Search,
+  SlidersHorizontal,
+  Sparkles,
   Square,
+  Subtitles,
   Sun,
   X,
 } from "lucide-react";
@@ -20,7 +31,6 @@ import { NotesPanel, UploadAudioModal } from "./components/NotesPanel";
 import { WaveformVisualizer } from "./components/WaveformVisualizer";
 import { AudioPlayerStage } from "./components/AudioPlayerStage";
 import {
-  LANGUAGE_OPTIONS,
   type ConnectionState,
   type LiveRefinementStatus,
   type SessionNotes,
@@ -35,7 +45,6 @@ import {
   bcp47ToScriptFamily,
   buildExportContent,
   cleanTranscriptArtifacts,
-  countWords,
   detectScriptFamily,
   downsampleBuffer,
   float32ToBase64Pcm16,
@@ -150,7 +159,7 @@ export default function App() {
   );
   const [searchQuery, setSearchQuery] = useState("");
   const [isSearchOpen, setIsSearchOpen] = useState(false);
-  const [isSidebarOpenMobile, setIsSidebarOpenMobile] = useState(false);
+  const [isDrawerOpen, setIsDrawerOpen] = useState(false);
   const [isUploadOpen, setIsUploadOpen] = useState(false);
   const [isExportOpen, setIsExportOpen] = useState(false);
   const [copiedAll, setCopiedAll] = useState(false);
@@ -177,11 +186,10 @@ export default function App() {
   const [isDark, setIsDark] = useState<boolean>(() => {
     try {
       const saved = localStorage.getItem(THEME_KEY);
-      if (saved === "dark") return true;
       if (saved === "light") return false;
-      return window.matchMedia("(prefers-color-scheme: dark)").matches;
+      return true;
     } catch {
-      return false;
+      return true;
     }
   });
 
@@ -2538,14 +2546,6 @@ export default function App() {
     }));
   };
 
-  const handleRenameSpeaker = (speakerId: string, newName: string) => {
-    updateSessionById(activeSession.id, (s) => ({
-      ...s,
-      updatedAt: Date.now(),
-      speakerNames: { ...s.speakerNames, [speakerId]: newName },
-    }));
-  };
-
   const handleSaveNotes = (notes: SessionNotes) => {
     updateSessionById(activeSession.id, (s) => ({
       ...s,
@@ -2580,25 +2580,10 @@ export default function App() {
     setIsExportOpen(false);
   };
 
-  const totalWords = useMemo(
-    () =>
-      activeSession.segments.reduce(
-        (sum, seg) => sum + countWords(seg.text),
-        0
-      ) + countWords(interimText),
-    [activeSession.segments, interimText]
-  );
-
   const displayedDuration =
     connectionState === "listening" || connectionState === "paused"
       ? liveDurationMs
       : activeSession.durationMs;
-
-  const activeLanguageLabel =
-    activeSession.detectedLanguages[0] ||
-    LANGUAGE_OPTIONS.find((l) => l.code === activeSession.config.languageCode)
-      ?.label ||
-    "Auto-detect";
 
   const isActiveLive =
     connectionState === "listening" ||
@@ -2609,14 +2594,27 @@ export default function App() {
     uploadedAudio !== null && uploadedAudio.sessionId === activeSession.id;
 
   return (
-    <div className="flex h-screen w-full overflow-hidden bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100">
+    <div className="relative flex h-screen w-full flex-col overflow-hidden bg-slate-100 text-slate-900 dark:bg-[#030816] dark:text-slate-100">
+      {/* Ambient luminous sapphire arc radiating behind the centered glass stage (Reference 1) */}
+      <div
+        aria-hidden="true"
+        className="pointer-events-none fixed inset-0 overflow-hidden"
+      >
+        <div className="absolute bottom-[-220px] left-1/2 h-[540px] w-[540px] -translate-x-1/2 rounded-full border-[14px] border-sky-400/20 blur-md sm:bottom-[-180px] sm:h-[680px] sm:w-[680px] dark:border-[#3b82f6]/55 dark:shadow-[0_0_64px_12px_rgba(37,99,235,0.48)]" />
+        <div className="absolute bottom-[-216px] left-1/2 h-[532px] w-[532px] -translate-x-1/2 rounded-full border-[2px] border-sky-200/25 sm:bottom-[-176px] sm:h-[672px] sm:w-[672px] dark:border-sky-200/50" />
+        <div className="absolute bottom-[-120px] left-1/2 h-[380px] w-[620px] -translate-x-1/2 rounded-full bg-[radial-gradient(circle_at_50%_55%,rgba(37,99,235,0.16),transparent_68%)] dark:bg-[radial-gradient(circle_at_50%_55%,rgba(37,99,235,0.42),transparent_68%)]" />
+      </div>
+
       <Sidebar
         sessions={sessions}
         activeSessionId={activeSession.id}
         connectionState={connectionState}
         config={activeSession.config}
-        isOpenMobile={isSidebarOpenMobile}
-        onCloseMobile={() => setIsSidebarOpenMobile(false)}
+        isOpen={isDrawerOpen}
+        audioDevices={audioDevices}
+        selectedDeviceId={selectedDeviceId}
+        onSelectDevice={setSelectedDeviceId}
+        onClose={() => setIsDrawerOpen(false)}
         onSelectSession={(id) => {
           if (uploadedAudio && uploadedAudio.sessionId !== id) {
             detachUploadedAudio();
@@ -2630,574 +2628,544 @@ export default function App() {
         onOpenUploadModal={() => setIsUploadOpen(true)}
       />
 
-      <main className="flex min-w-0 flex-1 flex-col">
-        {/* Top workspace bar (3-zone layout) */}
-        <header className="flex h-14 shrink-0 items-center justify-between gap-4 border-b border-slate-200 bg-white px-4 dark:border-slate-800 dark:bg-slate-900 sm:px-6">
-          {/* Zone 1: Editable Session Title & Unboxed Metadata */}
-          <div className="flex min-w-0 items-center gap-3">
-            <button
-              type="button"
-              onClick={() => setIsSidebarOpenMobile(true)}
-              aria-label="Open sessions sidebar"
-              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800 lg:hidden"
-            >
-              <Menu className="h-4 w-4" />
-            </button>
-            <div className="min-w-0">
-              <input
-                type="text"
-                value={activeSession.title}
-                onChange={(e) =>
-                  updateSessionById(activeSession.id, (s) => ({
-                    ...s,
-                    title: e.target.value,
-                    updatedAt: Date.now(),
-                  }))
-                }
-                aria-label="Session title"
-                className="w-44 truncate bg-transparent font-display text-sm font-semibold text-slate-900 focus:outline-none sm:w-64 dark:text-slate-100"
-              />
-              <div className="flex items-center gap-1.5 text-[11px] text-slate-500 dark:text-slate-400 tabular-nums">
-                <span>{formatDuration(displayedDuration)}</span>
-                <span aria-hidden="true">·</span>
-                <span>{totalWords} words</span>
-                <span aria-hidden="true" className="hidden sm:inline">
-                  ·
-                </span>
-                <span className="hidden truncate sm:inline">
-                  {activeLanguageLabel}
-                </span>
-              </div>
-            </div>
-          </div>
-
-          {/* Zone 2: View Switch */}
-          <div className="hidden items-center gap-1 rounded-lg bg-slate-100 p-1 md:flex dark:bg-slate-800">
-            <button
-              type="button"
-              onClick={() => setActiveTab("transcript")}
-              className={`rounded-md px-3 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
-                activeTab === "transcript"
-                  ? "bg-white text-slate-900 shadow-xs dark:bg-slate-700 dark:text-slate-100"
-                  : "text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-100"
-              }`}
-            >
-              Transcript
-            </button>
-            <button
-              type="button"
-              onClick={() => setActiveTab("notes")}
-              className={`rounded-md px-3 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
-                activeTab === "notes"
-                  ? "bg-white text-slate-900 shadow-xs dark:bg-slate-700 dark:text-slate-100"
-                  : "text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-100"
-              }`}
-            >
-              Notes & Summary
-            </button>
-          </div>
-
-          {/* Zone 3: Utilities & Theme */}
-          <div className="flex items-center gap-1.5 shrink-0">
-            {isSearchOpen ? (
-              <div className="flex items-center rounded-lg border border-slate-200 bg-slate-50 px-2 dark:border-slate-700 dark:bg-slate-800">
-                <Search className="h-3.5 w-3.5 text-slate-400" />
-                <input
-                  type="text"
-                  autoFocus
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="Find..."
-                  className="h-8 w-28 bg-transparent px-2 text-xs text-slate-900 placeholder:text-slate-400 focus:outline-none sm:w-40 dark:text-slate-100"
-                />
-                <button
-                  type="button"
-                  onClick={() => {
-                    setSearchQuery("");
-                    setIsSearchOpen(false);
-                  }}
-                  aria-label="Clear search"
-                  className="text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
-                >
-                  <X className="h-3.5 w-3.5" />
-                </button>
-              </div>
-            ) : (
-              <button
-                type="button"
-                onClick={() => setIsSearchOpen(true)}
-                aria-label="Search transcript"
-                className="flex h-9 w-9 items-center justify-center rounded-lg text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
-              >
-                <Search className="h-4 w-4" />
-              </button>
-            )}
-
-            <button
-              type="button"
-              onClick={handleCopyAll}
-              disabled={activeSession.segments.length === 0}
-              className="hidden h-9 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-40 sm:flex dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800 whitespace-nowrap shrink-0"
-            >
-              {copiedAll ? (
-                <Check className="h-3.5 w-3.5 text-emerald-600" />
-              ) : (
-                <Copy className="h-3.5 w-3.5" />
-              )}
-              <span>{copiedAll ? "Copied" : "Copy"}</span>
-            </button>
-
-            <div className="relative">
-              <button
-                type="button"
-                disabled={activeSession.segments.length === 0}
-                onClick={() => setIsExportOpen((o) => !o)}
-                className="flex h-9 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-40 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800 whitespace-nowrap shrink-0"
-              >
-                <Download className="h-3.5 w-3.5" />
-                <span className="hidden sm:inline">Export</span>
-              </button>
-              {isExportOpen && (
-                <>
-                  <div
-                    onClick={() => setIsExportOpen(false)}
-                    className="fixed inset-0 z-20"
-                  />
-                  <div className="absolute right-0 z-30 mt-1.5 w-40 rounded-lg border border-slate-200 bg-white py-1 shadow-lg dark:border-slate-700 dark:bg-slate-900">
-                    {(
-                      [
-                        { id: "txt", label: "Plain Text (.txt)" },
-                        { id: "md", label: "Markdown (.md)" },
-                        { id: "srt", label: "Subtitles (.srt)" },
-                        { id: "json", label: "JSON (.json)" },
-                      ] as const
-                    ).map((item) => (
-                      <button
-                        key={item.id}
-                        type="button"
-                        onClick={() => handleExport(item.id)}
-                        className="flex w-full items-center px-3 py-2 text-left text-xs text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800"
-                      >
-                        {item.label}
-                      </button>
-                    ))}
-                  </div>
-                </>
-              )}
-            </div>
-
-            <button
-              type="button"
-              onClick={() => setIsDark((d) => !d)}
-              aria-label={isDark ? "Switch to light mode" : "Switch to dark mode"}
-              className="flex h-9 w-9 items-center justify-center rounded-lg text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
-            >
-              {isDark ? (
-                <Sun className="h-4 w-4" />
-              ) : (
-                <Moon className="h-4 w-4" />
-              )}
-            </button>
-          </div>
-        </header>
-
-        {/* Mobile tab switcher */}
-        <div className="flex border-b border-slate-200 bg-white px-4 py-2 md:hidden dark:border-slate-800 dark:bg-slate-900">
-          <div className="grid w-full grid-cols-2 gap-1 rounded-lg bg-slate-100 p-1 dark:bg-slate-800">
-            <button
-              type="button"
-              onClick={() => setActiveTab("transcript")}
-              className={`rounded-md py-1 text-xs font-medium ${
-                activeTab === "transcript"
-                  ? "bg-white text-slate-900 shadow-xs dark:bg-slate-700 dark:text-slate-100"
-                  : "text-slate-600 dark:text-slate-400"
-              }`}
-            >
-              Transcript
-            </button>
-            <button
-              type="button"
-              onClick={() => setActiveTab("notes")}
-              className={`rounded-md py-1 text-xs font-medium ${
-                activeTab === "notes"
-                  ? "bg-white text-slate-900 shadow-xs dark:bg-slate-700 dark:text-slate-100"
-                  : "text-slate-600 dark:text-slate-400"
-              }`}
-            >
-              Notes & Summary
-            </button>
-          </div>
+      {/* Minimalist Icon-Only Top Bar */}
+      <header className="relative z-20 flex h-14 shrink-0 items-center justify-between gap-2 px-3 sm:gap-4 sm:px-6">
+        {/* Zone 1: Drawer, New Session, Upload */}
+        <div className="flex items-center gap-1.5">
+          <button
+            type="button"
+            onClick={() => setIsDrawerOpen(true)}
+            aria-label="Open sessions and settings"
+            title="Sessions & settings"
+            className="flex h-9 w-9 items-center justify-center rounded-full border border-slate-300/70 bg-white/75 text-slate-700 backdrop-blur-md transition-colors hover:bg-white dark:border-white/12 dark:bg-white/[0.05] dark:text-slate-200 dark:hover:bg-white/15"
+          >
+            <PanelLeft className="h-4 w-4" />
+          </button>
+          <button
+            type="button"
+            disabled={isActiveLive}
+            onClick={handleNewSession}
+            aria-label="New session"
+            title="New session"
+            className="flex h-9 w-9 items-center justify-center rounded-full border border-slate-300/70 bg-white/75 text-slate-700 backdrop-blur-md transition-colors hover:bg-white disabled:opacity-40 dark:border-white/12 dark:bg-white/[0.05] dark:text-slate-200 dark:hover:bg-white/15"
+          >
+            <Plus className="h-4 w-4" />
+          </button>
         </div>
 
-        {/* Error banner */}
-        {errorMessage && (
-          <div className="flex items-center justify-between gap-3 border-b border-rose-200 bg-rose-50 px-4 py-2.5 text-xs text-rose-800 dark:border-rose-900/60 dark:bg-rose-950/60 dark:text-rose-200 sm:px-6">
-            <div className="flex items-center gap-2">
-              <AlertCircle className="h-4 w-4 shrink-0 text-rose-600 dark:text-rose-400" />
-              <span>{errorMessage}</span>
+        {/* Zone 2: Transcript / Notes icon-only segmented switch */}
+        <div className="flex items-center gap-1 rounded-full border border-slate-300/70 bg-white/75 p-1 backdrop-blur-md dark:border-white/12 dark:bg-white/[0.05]">
+          <button
+            type="button"
+            onClick={() => setActiveTab("transcript")}
+            aria-label="Transcript view"
+            title="Transcript"
+            className={`flex h-7 w-10 items-center justify-center rounded-full transition-colors ${
+              activeTab === "transcript"
+                ? "bg-sky-500 text-white shadow-xs"
+                : "text-slate-500 hover:text-slate-900 dark:text-slate-300 dark:hover:text-white"
+            }`}
+          >
+            <AudioLines className="h-3.5 w-3.5" />
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab("notes")}
+            aria-label="Notes view"
+            title="Notes"
+            className={`flex h-7 w-10 items-center justify-center rounded-full transition-colors ${
+              activeTab === "notes"
+                ? "bg-sky-500 text-white shadow-xs"
+                : "text-slate-500 hover:text-slate-900 dark:text-slate-300 dark:hover:text-white"
+            }`}
+          >
+            <Sparkles className="h-3.5 w-3.5" />
+          </button>
+        </div>
+
+        {/* Zone 3: Search, Copy, Export, Theme (icon-only) */}
+        <div className="flex items-center gap-1.5 shrink-0">
+          {isSearchOpen ? (
+            <div className="flex items-center rounded-full border border-slate-300/80 bg-white/85 px-2.5 backdrop-blur-md dark:border-white/15 dark:bg-white/[0.08]">
+              <Search className="h-3.5 w-3.5 text-slate-400" />
+              <input
+                type="text"
+                autoFocus
+                aria-label="Search transcript text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="h-8 w-24 bg-transparent px-2 text-xs text-slate-900 focus:outline-none sm:w-36 dark:text-white"
+              />
+              <button
+                type="button"
+                onClick={() => {
+                  setSearchQuery("");
+                  setIsSearchOpen(false);
+                }}
+                aria-label="Clear search"
+                title="Clear search"
+                className="text-slate-400 hover:text-slate-700 dark:hover:text-white"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
             </div>
+          ) : (
             <button
               type="button"
-              onClick={() => setErrorMessage(null)}
-              aria-label="Dismiss error"
-              className="rounded p-1 hover:bg-rose-100 dark:hover:bg-rose-900/50"
+              onClick={() => setIsSearchOpen(true)}
+              aria-label="Search transcript"
+              title="Search"
+              className="flex h-9 w-9 items-center justify-center rounded-full border border-slate-300/70 bg-white/75 text-slate-700 backdrop-blur-md transition-colors hover:bg-white dark:border-white/12 dark:bg-white/[0.05] dark:text-slate-200 dark:hover:bg-white/15"
+            >
+              <Search className="h-4 w-4" />
+            </button>
+          )}
+
+          <button
+            type="button"
+            onClick={handleCopyAll}
+            disabled={activeSession.segments.length === 0}
+            aria-label="Copy transcript"
+            title="Copy"
+            className="flex h-9 w-9 items-center justify-center rounded-full border border-slate-300/70 bg-white/75 text-slate-700 backdrop-blur-md transition-colors hover:bg-white disabled:opacity-40 dark:border-white/12 dark:bg-white/[0.05] dark:text-slate-200 dark:hover:bg-white/15"
+          >
+            {copiedAll ? (
+              <Check className="h-4 w-4 text-emerald-400" />
+            ) : (
+              <Copy className="h-4 w-4" />
+            )}
+          </button>
+
+          <div className="relative">
+            <button
+              type="button"
+              disabled={activeSession.segments.length === 0}
+              onClick={() => setIsExportOpen((o) => !o)}
+              aria-label="Export transcript"
+              title="Export"
+              className="flex h-9 w-9 items-center justify-center rounded-full border border-slate-300/70 bg-white/75 text-slate-700 backdrop-blur-md transition-colors hover:bg-white disabled:opacity-40 dark:border-white/12 dark:bg-white/[0.05] dark:text-slate-200 dark:hover:bg-white/15"
+            >
+              <Download className="h-4 w-4" />
+            </button>
+            {isExportOpen && (
+              <>
+                <div
+                  onClick={() => setIsExportOpen(false)}
+                  className="fixed inset-0 z-20"
+                />
+                <div className="absolute right-0 z-30 mt-2 flex flex-col gap-1 rounded-2xl border border-slate-200/80 bg-white/95 p-1.5 shadow-xl backdrop-blur-xl dark:border-white/12 dark:bg-[#081229]/95">
+                  {(
+                    [
+                      { id: "txt", label: "TXT", Icon: FileText },
+                      { id: "md", label: "MD", Icon: FileCode },
+                      { id: "srt", label: "SRT", Icon: Subtitles },
+                      { id: "json", label: "JSON", Icon: FileJson },
+                    ] as const
+                  ).map(({ id, label, Icon }) => (
+                    <button
+                      key={id}
+                      type="button"
+                      onClick={() => handleExport(id)}
+                      aria-label={`Export ${label}`}
+                      title={`Export .${id}`}
+                      className="flex h-9 w-9 items-center justify-center rounded-xl text-slate-600 transition-colors hover:bg-slate-100 hover:text-slate-900 dark:text-slate-300 dark:hover:bg-white/10 dark:hover:text-white"
+                    >
+                      <Icon className="h-4 w-4" />
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
+
+          <button
+            type="button"
+            onClick={() => setIsDark((d) => !d)}
+            aria-label={isDark ? "Switch to light mode" : "Switch to dark mode"}
+            title={isDark ? "Light mode" : "Dark mode"}
+            className="flex h-9 w-9 items-center justify-center rounded-full border border-slate-300/70 bg-white/75 text-slate-700 backdrop-blur-md transition-colors hover:bg-white dark:border-white/12 dark:bg-white/[0.05] dark:text-slate-200 dark:hover:bg-white/15"
+          >
+            {isDark ? (
+              <Sun className="h-4 w-4" />
+            ) : (
+              <Moon className="h-4 w-4" />
+            )}
+          </button>
+        </div>
+      </header>
+
+      {/* Main Centered Frosted Glass Stage + Docked Reference-2 Console */}
+      <main className="relative z-10 flex min-h-0 flex-1 flex-col items-center justify-center px-3 pb-4 pt-1 sm:px-6 sm:pb-6">
+        <div className="relative flex min-h-0 w-full max-w-[640px] flex-1 flex-col overflow-hidden rounded-[28px] border border-slate-200/80 bg-white/85 shadow-xl backdrop-blur-2xl dark:border-white/[0.11] dark:bg-transparent dark:bg-gradient-to-b dark:from-[#08132d]/68 dark:via-[#050d22]/78 dark:to-[#0c2d85]/84 dark:shadow-[0_24px_80px_-12px_rgba(12,56,180,0.55)]">
+          {/* Top-right contextual close button (Reference 1 corner orb) */}
+          {(isActiveLive || hasPlayerForActiveSession || activeTab === "notes") && (
+            <button
+              type="button"
+              onClick={() => {
+                if (isActiveLive) {
+                  stopRecording();
+                } else if (hasPlayerForActiveSession) {
+                  detachUploadedAudio();
+                } else {
+                  setActiveTab("transcript");
+                }
+              }}
+              aria-label={
+                isActiveLive
+                  ? "Stop recording"
+                  : hasPlayerForActiveSession
+                    ? "Close audio player"
+                    : "Close notes"
+              }
+              title={
+                isActiveLive
+                  ? "Stop"
+                  : hasPlayerForActiveSession
+                    ? "Close audio"
+                    : "Transcript"
+              }
+              className="absolute right-3.5 top-3.5 z-20 flex h-8 w-8 items-center justify-center rounded-full border border-slate-300/60 bg-white/75 text-slate-600 backdrop-blur-md transition-colors hover:bg-white dark:border-white/15 dark:bg-white/10 dark:text-slate-200 dark:hover:bg-white/20"
             >
               <X className="h-3.5 w-3.5" />
             </button>
-          </div>
-        )}
+          )}
 
-        {/* YouTube-style Synced Audio & Live Caption Stage */}
-        {hasPlayerForActiveSession && uploadedAudio && activeTab === "transcript" && (
-          <AudioPlayerStage
-            audioUrl={uploadedAudio.url}
-            audioRef={audioElRef}
-            fileName={uploadedAudio.fileName}
-            segments={activeSession.segments}
-            interimText={interimText}
-            currentTimeMs={playbackTimeMs}
-            durationMs={uploadedAudio.durationMs || activeSession.durationMs}
-            isPlaying={isAudioPlaying}
-            chunkProgress={chunkProgress}
-            onTimeUpdate={setPlaybackTimeMs}
-            onDurationChange={(ms) =>
-              setUploadedAudio((prev) =>
-                prev ? { ...prev, durationMs: ms } : prev
-              )
-            }
-            onPlayStateChange={(playing, ended) => {
-              if (playing) {
-                audioPlaybackEndedRef.current = false;
-                isAudioPlayingRef.current = true;
-                isPreBufferingRef.current = false;
-                setIsAudioPlaying(true);
-                setChunkProgress((prev) =>
-                  prev
-                    ? { ...prev, isBuffering: false, isPaused: false }
-                    : prev
-                );
-              } else if (ended) {
-                audioPlaybackEndedRef.current = true;
-                isAudioPlayingRef.current = false;
-                isPreBufferingRef.current = false;
-                setIsAudioPlaying(false);
-                setChunkProgress((prev) =>
-                  prev
-                    ? {
-                        ...prev,
-                        isBuffering: false,
-                        isPaused: false,
-                        isAudioEnded: true,
-                      }
-                    : prev
-                );
-              } else {
-                audioPlaybackEndedRef.current = false;
-                isAudioPlayingRef.current = false;
-                isPreBufferingRef.current = false;
-                setIsAudioPlaying(false);
-                setChunkProgress((prev) =>
-                  prev
-                    ? {
-                        ...prev,
-                        isBuffering: false,
-                        isPaused: true,
-                        activeChunkIndices: [],
-                      }
-                    : prev
-                );
-              }
-            }}
-            onSeekToMs={handleSeekAudioMs}
-            onStopAudio={handleStopAudio}
-            onCloseAudio={detachUploadedAudio}
-          />
-        )}
+          {/* Error banner */}
+          {errorMessage && (
+            <div className="flex items-center justify-between gap-3 border-b border-rose-500/25 bg-rose-500/10 px-5 py-2.5 text-xs text-rose-600 dark:text-rose-200">
+              <div className="flex items-center gap-2">
+                <AlertCircle className="h-4 w-4 shrink-0" />
+                <span>{errorMessage}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setErrorMessage(null)}
+                aria-label="Dismiss error"
+                className="flex h-7 w-7 items-center justify-center rounded-full hover:bg-rose-500/15"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          )}
 
-        {/* Main content viewport */}
-        {activeTab === "transcript" ? (
-          <TranscriptStream
-            session={activeSession}
-            interimText={interimText}
-            interimSpeaker={interimSpeaker}
-            interimLanguage={interimLanguage}
-            connectionState={connectionState}
-            liveRefinementStatus={
-              livePipelineRef.current.targetSessionId === activeSession.id
-                ? liveRefinementStatus
-                : null
-            }
-            searchQuery={searchQuery}
-            hasAudioPlayer={hasPlayerForActiveSession}
-            playbackTimeMs={playbackTimeMs}
-            isAudioPlaying={isAudioPlaying}
-            chunkProgress={
-              hasPlayerForActiveSession ? chunkProgress : null
-            }
-            onSeekAudioMs={handleSeekAudioMs}
-            onStartRecording={startRecording}
-            onOpenUploadModal={() => setIsUploadOpen(true)}
-            onUpdateSegmentText={handleUpdateSegmentText}
-            onRenameSpeaker={handleRenameSpeaker}
-          />
-        ) : (
-          <NotesPanel session={activeSession} onSaveNotes={handleSaveNotes} />
-        )}
-
-        {/* Bottom Acoustic Transport Dock */}
-        <footer className="relative shrink-0 border-t border-slate-200 bg-white px-4 py-3 dark:border-slate-800 dark:bg-slate-900 sm:px-6">
-          {!hasPlayerForActiveSession && liveRefinementStatus && (
-            <div
-              className="absolute inset-x-0 top-0 h-0.5 bg-slate-100 dark:bg-slate-800"
-              aria-hidden="true"
-            >
-              <div
-                className={`h-full transition-all duration-200 ${
-                  liveRefinementStatus.refiningWindowsCount > 0
-                    ? "bg-emerald-500"
-                    : "bg-rose-500"
-                }`}
-                style={{
-                  width: `${Math.min(
-                    100,
-                    Math.max(
-                      0,
-                      (liveRefinementStatus.bufferElapsedMs /
-                        Math.max(1, liveRefinementStatus.bufferDurationMs)) *
-                        100
-                    )
-                  )}%`,
+          {/* Synced Audio Player Stage when file uploaded */}
+          {hasPlayerForActiveSession &&
+            uploadedAudio &&
+            activeTab === "transcript" && (
+              <AudioPlayerStage
+                audioUrl={uploadedAudio.url}
+                audioRef={audioElRef}
+                fileName={uploadedAudio.fileName}
+                segments={activeSession.segments}
+                interimText={interimText}
+                currentTimeMs={playbackTimeMs}
+                durationMs={uploadedAudio.durationMs || activeSession.durationMs}
+                isPlaying={isAudioPlaying}
+                chunkProgress={chunkProgress}
+                onTimeUpdate={setPlaybackTimeMs}
+                onDurationChange={(ms) =>
+                  setUploadedAudio((prev) =>
+                    prev ? { ...prev, durationMs: ms } : prev
+                  )
+                }
+                onPlayStateChange={(playing, ended) => {
+                  if (playing) {
+                    audioPlaybackEndedRef.current = false;
+                    isAudioPlayingRef.current = true;
+                    isPreBufferingRef.current = false;
+                    setIsAudioPlaying(true);
+                    setChunkProgress((prev) =>
+                      prev
+                        ? { ...prev, isBuffering: false, isPaused: false }
+                        : prev
+                    );
+                  } else if (ended) {
+                    audioPlaybackEndedRef.current = true;
+                    isAudioPlayingRef.current = false;
+                    isPreBufferingRef.current = false;
+                    setIsAudioPlaying(false);
+                    setChunkProgress((prev) =>
+                      prev
+                        ? {
+                            ...prev,
+                            isBuffering: false,
+                            isPaused: false,
+                            isAudioEnded: true,
+                          }
+                        : prev
+                    );
+                  } else {
+                    audioPlaybackEndedRef.current = false;
+                    isAudioPlayingRef.current = false;
+                    isPreBufferingRef.current = false;
+                    setIsAudioPlaying(false);
+                    setChunkProgress((prev) =>
+                      prev
+                        ? {
+                            ...prev,
+                            isBuffering: false,
+                            isPaused: true,
+                            activeChunkIndices: [],
+                          }
+                        : prev
+                    );
+                  }
                 }}
+                onSeekToMs={handleSeekAudioMs}
+                onStopAudio={handleStopAudio}
+                onCloseAudio={detachUploadedAudio}
+              />
+            )}
+
+          {/* Transcript or Notes viewport */}
+          {activeTab === "transcript" ? (
+            <TranscriptStream
+              session={activeSession}
+              interimText={interimText}
+              connectionState={connectionState}
+              searchQuery={searchQuery}
+              hasAudioPlayer={hasPlayerForActiveSession}
+              playbackTimeMs={playbackTimeMs}
+              isAudioPlaying={isAudioPlaying}
+              chunkProgress={
+                hasPlayerForActiveSession ? chunkProgress : null
+              }
+              onSeekAudioMs={handleSeekAudioMs}
+              onUpdateSegmentText={handleUpdateSegmentText}
+            />
+          ) : (
+            <NotesPanel session={activeSession} onSaveNotes={handleSaveNotes} />
+          )}
+
+          {/* Integrated Luminous Sine-Wave Visualizer (Reference 1) */}
+          {activeTab === "transcript" && !hasPlayerForActiveSession && (
+            <div className="shrink-0 px-5 pb-3 pt-1">
+              <WaveformVisualizer
+                analyser={analyserNode}
+                state={connectionState}
+                isDark={isDark}
               />
             </div>
           )}
-          {hasPlayerForActiveSession ? (
-            <div className="mx-auto flex max-w-3xl items-center justify-between gap-4">
-              <div className="flex items-center gap-2 text-xs font-medium whitespace-nowrap shrink-0">
-                {chunkProgress?.isBuffering ? (
-                  <>
-                    <span className="h-2 w-2 rounded-full bg-rose-500 animate-pulse" />
-                    <span className="text-rose-600 dark:text-rose-400">
-                      Transcribing...
-                    </span>
-                  </>
-                ) : isAudioPlaying ? (
-                  <>
-                    <span className="h-2 w-2 rounded-full bg-rose-600 animate-pulse" />
-                    <span className="text-rose-600 dark:text-rose-400">
-                      Synced Live Playback
-                    </span>
-                  </>
-                ) : chunkProgress?.isAudioEnded &&
-                  chunkProgress.isProcessing &&
-                  !chunkProgress.isPaused ? (
-                  <>
-                    <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
-                    <span className="text-emerald-600 dark:text-emerald-400">
-                      Completing Transcript
-                    </span>
-                  </>
-                ) : chunkProgress &&
-                  chunkProgress.totalChunks > 0 &&
-                  chunkProgress.completedChunks >= chunkProgress.totalChunks ? (
-                  <span className="text-emerald-600 dark:text-emerald-400">
-                    Transcript Complete
-                  </span>
-                ) : (
-                  <span className="text-slate-500 dark:text-slate-400">
-                    Playback Paused
+        </div>
+
+        {/* Reference-2 Inspired Docked Icon-Only Control Capsule */}
+        <footer className="relative z-20 mt-3 w-full max-w-[490px] shrink-0">
+          <div className="overflow-visible rounded-[28px] border border-slate-200/80 bg-white/95 shadow-[0_18px_45px_rgba(2,8,23,0.18)] backdrop-blur-2xl dark:border-white/12 dark:bg-[#07090e] dark:shadow-[0_20px_50px_rgba(0,0,0,0.75)]">
+            {/* Upper glowing sapphire display strip with hairline rolling-10s / upload progress */}
+            <div className="relative flex h-8 items-center justify-between overflow-hidden rounded-t-[27px] bg-gradient-to-r from-[#0ea5e9] via-[#1565ef] to-[#0838b5] px-5 text-white/90">
+              <div
+                aria-hidden="true"
+                className="pointer-events-none absolute inset-0 bg-[linear-gradient(125deg,rgba(255,255,255,0.28)_0%,rgba(255,255,255,0.08)_38%,transparent_42%)]"
+              />
+              {!hasPlayerForActiveSession && liveRefinementStatus && (
+                <div
+                  aria-hidden="true"
+                  className="absolute inset-x-0 bottom-0 h-[2px] bg-black/20"
+                >
+                  <div
+                    className={`h-full transition-all duration-200 ${
+                      liveRefinementStatus.refiningWindowsCount > 0
+                        ? "bg-emerald-300"
+                        : "bg-white/90"
+                    }`}
+                    style={{
+                      width: `${Math.min(
+                        100,
+                        Math.max(
+                          0,
+                          (liveRefinementStatus.bufferElapsedMs /
+                            Math.max(1, liveRefinementStatus.bufferDurationMs)) *
+                            100
+                        )
+                      )}%`,
+                    }}
+                  />
+                </div>
+              )}
+
+              <div className="relative z-10 flex items-center gap-1.5 font-mono text-[11px] tabular-nums">
+                {connectionState === "listening" && (
+                  <span
+                    className={`h-1.5 w-1.5 rounded-full animate-pulse ${
+                      liveRefinementStatus?.liveWorkerStatus === "dropped"
+                        ? "bg-amber-300"
+                        : "bg-white"
+                    }`}
+                  />
+                )}
+                {liveRefinementStatus &&
+                  liveRefinementStatus.refiningWindowsCount > 0 && (
+                    <Loader2 className="h-3 w-3 animate-spin text-emerald-200" />
+                  )}
+                {(displayedDuration > 0 ||
+                  isActiveLive ||
+                  hasPlayerForActiveSession) && (
+                  <span>
+                    {formatDuration(
+                      hasPlayerForActiveSession
+                        ? playbackTimeMs
+                        : displayedDuration
+                    )}
                   </span>
                 )}
               </div>
-              <div className="text-xs text-slate-500 dark:text-slate-400 tabular-nums truncate">
-                {chunkProgress
-                  ? chunkProgress.isBuffering
-                    ? chunkProgress.preRollStage === "segmenting"
-                      ? "Segmenting audio into 15s clips..."
-                      : chunkProgress.preRollStage === "connecting"
-                        ? `Readying ${chunkProgress.waveCount ?? 2} waves (${chunkProgress.readyWorkers ?? 0}/${chunkProgress.workerCount ?? 6} workers)...`
-                        : (chunkProgress.waveCount ?? 1) > 1
-                          ? `Focusing on segments 1 & 2 (${chunkProgress.readyWorkers ?? 0}/${chunkProgress.workerCount ?? 6} workers ready)`
-                          : `Finishing segment 1 (${chunkProgress.readyWorkers ?? 0}/${chunkProgress.workerCount ?? 3} workers ready)`
-                    : chunkProgress.totalChunks > 0
-                      ? `${chunkProgress.completedChunks}/${chunkProgress.totalChunks} segments (15s)`
-                      : "Slicing 15s segments..."
-                  : "Audio loaded"}
+
+              <div className="relative z-10 flex items-center gap-1.5">
+                {hasPlayerForActiveSession && chunkProgress ? (
+                  chunkProgress.isProcessing ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin text-white/90" />
+                  ) : null
+                ) : activeSession.config.mode === "VERBATIM" ? (
+                  <span
+                    title={`Verbatim · ${activeSession.config.languageCode.toUpperCase()}`}
+                    aria-label="Verbatim mode"
+                  >
+                    <AudioWaveform className="h-3.5 w-3.5 opacity-85" />
+                  </span>
+                ) : (
+                  <span
+                    title={`Smart clean · ${activeSession.config.languageCode.toUpperCase()}`}
+                    aria-label="Smart clean mode"
+                  >
+                    <Sparkles className="h-3.5 w-3.5 opacity-85" />
+                  </span>
+                )}
               </div>
-              <div className="flex items-center gap-2 shrink-0">
-                <button
-                  type="button"
-                  disabled={Boolean(chunkProgress?.isBuffering)}
-                  onClick={() => {
-                    if (isPreBufferingRef.current) return;
-                    const audio = audioElRef.current;
-                    if (!audio) return;
-                    if (audio.paused) {
-                      void audio.play();
-                    } else {
-                      audio.pause();
-                    }
-                  }}
-                  className="flex h-10 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3.5 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-45 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700 whitespace-nowrap shrink-0"
-                >
-                  {isAudioPlaying ? (
-                    <>
-                      <Pause className="h-3.5 w-3.5" />
-                      <span>Pause</span>
-                    </>
-                  ) : (
-                    <>
-                      <Play className="h-3.5 w-3.5" />
-                      <span>Play</span>
-                    </>
-                  )}
-                </button>
+            </div>
+
+            {/* Lower matte capsule housing with Left Capsule · Raised Center Orb · Right Capsule */}
+            <div className="relative flex items-center justify-between px-4 py-2.5 sm:px-5">
+              {/* Left Capsule Button (icon-only) */}
+              {hasPlayerForActiveSession ? (
                 <button
                   type="button"
                   disabled={Boolean(chunkProgress?.isBuffering)}
                   onClick={handleStopAudio}
-                  className="flex h-10 items-center gap-2 rounded-lg bg-slate-900 px-4 text-xs font-medium text-white transition-colors hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-45 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-200 whitespace-nowrap shrink-0"
+                  aria-label="Stop audio"
+                  title="Stop"
+                  className="flex h-10 w-20 items-center justify-center rounded-full border border-slate-300/80 bg-slate-100/80 text-slate-700 transition-colors hover:border-sky-400/60 hover:bg-slate-200/70 disabled:opacity-40 sm:w-28 dark:border-white/25 dark:bg-white/[0.03] dark:text-slate-100 dark:hover:border-white/50 dark:hover:bg-white/[0.08]"
                 >
-                  <Square className="h-3.5 w-3.5 fill-current" />
-                  <span>Stop</span>
+                  <Square className="h-4 w-4 fill-current" />
                 </button>
-              </div>
-            </div>
-          ) : (
-            <div className="mx-auto flex max-w-3xl items-center justify-between gap-4">
-              {/* Left: Status, 1+4 Backward Progress, & Device selector */}
-              <div className="flex min-w-0 items-center gap-3">
-                <div className="flex items-center gap-2 text-xs font-medium whitespace-nowrap shrink-0">
-                  {connectionState === "listening" && (
-                    <>
-                      <span className="h-2 w-2 rounded-full bg-rose-600 animate-pulse" />
-                      <span className="text-rose-600 dark:text-rose-400">
-                        {liveRefinementStatus?.liveWorkerStatus === "dropped"
-                          ? "4 Backward Active"
-                          : liveRefinementStatus?.liveWorkerStatus ===
-                              "reconnecting"
-                            ? "Live Reconnecting"
-                            : "Recording"}
-                      </span>
-                    </>
+              ) : isActiveLive ? (
+                <button
+                  type="button"
+                  onClick={togglePause}
+                  aria-label={
+                    connectionState === "paused"
+                      ? "Resume recording"
+                      : "Pause recording"
+                  }
+                  title={connectionState === "paused" ? "Resume" : "Pause"}
+                  className="flex h-10 w-20 items-center justify-center rounded-full border border-slate-300/80 bg-slate-100/80 text-slate-700 transition-colors hover:border-sky-400/60 hover:bg-slate-200/70 sm:w-28 dark:border-white/25 dark:bg-white/[0.03] dark:text-slate-100 dark:hover:border-white/50 dark:hover:bg-white/[0.08]"
+                >
+                  {connectionState === "paused" ? (
+                    <Play className="h-4 w-4 translate-x-[0.5px] fill-current" />
+                  ) : (
+                    <Pause className="h-4 w-4 fill-current" />
                   )}
-                  {connectionState === "connecting" && (
-                    <span className="text-slate-600 dark:text-slate-300">
-                      Connecting...
-                    </span>
-                  )}
-                  {connectionState === "paused" && (
-                    <span className="text-amber-600 dark:text-amber-400">
-                      Paused
-                    </span>
-                  )}
-                  {(connectionState === "idle" ||
-                    connectionState === "stopping" ||
-                    connectionState === "error") &&
-                    (liveRefinementStatus &&
-                    liveRefinementStatus.refiningWindowsCount > 0 ? (
-                      <span className="text-emerald-600 dark:text-emerald-400">
-                        Refining final pass...
-                      </span>
-                    ) : (
-                      <span className="text-slate-500 dark:text-slate-400">
-                        Standby
-                      </span>
-                    ))}
-                </div>
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setIsDrawerOpen(true)}
+                  aria-label="Engine settings"
+                  title="Settings"
+                  className="flex h-10 w-20 items-center justify-center rounded-full border border-slate-300/80 bg-slate-100/80 text-slate-700 transition-colors hover:border-sky-400/60 hover:bg-slate-200/70 sm:w-28 dark:border-white/25 dark:bg-white/[0.03] dark:text-slate-100 dark:hover:border-white/50 dark:hover:bg-white/[0.08]"
+                >
+                  <SlidersHorizontal className="h-4 w-4" />
+                </button>
+              )}
 
-                {liveRefinementStatus && (
-                  <span className="hidden text-[11px] font-mono tabular-nums text-slate-500 dark:text-slate-400 md:inline truncate">
-                    {liveRefinementStatus.refiningWindowsCount > 0
-                      ? `10s #${liveRefinementStatus.windowIndex + 1} · 4 backward refining (${liveRefinementStatus.refiningWindowsCount})`
-                      : `10s buffer ${(
-                          liveRefinementStatus.bufferElapsedMs / 1000
-                        ).toFixed(1)}s/10s · ${liveRefinementStatus.refinedWindowsCount} refined`}
-                  </span>
-                )}
-
-                {audioDevices.length > 0 && !liveRefinementStatus && (
-                  <select
-                    aria-label="Microphone input device"
-                    disabled={isActiveLive}
-                    value={selectedDeviceId}
-                    onChange={(e) => setSelectedDeviceId(e.target.value)}
-                    className="hidden h-8 max-w-[180px] truncate rounded-md border border-slate-200 bg-slate-50 px-2 text-xs text-slate-700 focus:outline-none disabled:opacity-60 sm:block dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
-                  >
-                    <option value="">Default microphone</option>
-                    {audioDevices.map((dev, i) => (
-                      <option key={dev.deviceId || i} value={dev.deviceId}>
-                        {dev.label || `Microphone ${i + 1}`}
-                      </option>
-                    ))}
-                  </select>
-                )}
-              </div>
-
-              {/* Center: Live Waveform & Timer */}
-              <div className="flex min-w-0 flex-1 items-center gap-3">
-                <div className="min-w-0 flex-1">
-                  <WaveformVisualizer
-                    analyser={analyserNode}
-                    state={connectionState}
-                    isDark={isDark}
-                  />
-                </div>
-                <span className="font-mono text-xs font-medium text-slate-600 tabular-nums dark:text-slate-300 whitespace-nowrap shrink-0">
-                  {formatDuration(displayedDuration)}
-                </span>
-              </div>
-
-              {/* Right: Transport Controls */}
-              <div className="flex items-center gap-2 shrink-0">
-                {(connectionState === "listening" ||
-                  connectionState === "paused") && (
+              {/* Center Raised Circular Orb Button (Reference 2 Focal Anchor) */}
+              <div className="relative -mt-6 flex items-center justify-center">
+                {hasPlayerForActiveSession ? (
                   <button
                     type="button"
-                    onClick={togglePause}
-                    aria-label={
-                      connectionState === "paused"
-                        ? "Resume recording"
-                        : "Pause recording"
-                    }
-                    className="flex h-10 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3.5 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700 whitespace-nowrap shrink-0"
+                    disabled={Boolean(chunkProgress?.isBuffering)}
+                    onClick={() => {
+                      if (isPreBufferingRef.current) return;
+                      const audio = audioElRef.current;
+                      if (!audio) return;
+                      if (audio.paused) {
+                        void audio.play();
+                      } else {
+                        audio.pause();
+                      }
+                    }}
+                    aria-label={isAudioPlaying ? "Pause playback" : "Play playback"}
+                    title={isAudioPlaying ? "Pause" : "Play"}
+                    className="flex h-14 w-14 items-center justify-center rounded-full border-[4px] border-white bg-gradient-to-b from-[#22c3ff] via-[#126cf1] to-[#0838b5] text-white shadow-[0_0_26px_rgba(29,110,242,0.65)] transition-transform hover:scale-105 active:scale-95 disabled:opacity-45 dark:border-[#07090e]"
                   >
-                    {connectionState === "paused" ? (
-                      <>
-                        <Play className="h-3.5 w-3.5" />
-                        <span>Resume</span>
-                      </>
+                    {isAudioPlaying ? (
+                      <Pause className="h-5 w-5 fill-current" />
                     ) : (
-                      <>
-                        <Pause className="h-3.5 w-3.5" />
-                        <span>Pause</span>
-                      </>
+                      <Play className="h-5 w-5 translate-x-[1px] fill-current" />
                     )}
                   </button>
-                )}
-
-                {isActiveLive ? (
+                ) : isActiveLive ? (
                   <button
                     type="button"
                     onClick={stopRecording}
-                    className="flex h-10 items-center gap-2 rounded-lg bg-slate-900 px-4 text-xs font-medium text-white transition-colors hover:bg-slate-800 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-200 whitespace-nowrap shrink-0"
+                    aria-label="Stop recording"
+                    title="Stop recording"
+                    className="flex h-14 w-14 items-center justify-center rounded-full border-[4px] border-white bg-white text-[#06122e] shadow-[0_0_30px_rgba(56,189,248,0.85)] transition-transform hover:scale-105 active:scale-95 dark:border-[#07090e]"
                   >
-                    <Square className="h-3.5 w-3.5 fill-current" />
-                    <span>Stop</span>
+                    <Square className="h-5 w-5 fill-current" />
                   </button>
                 ) : (
                   <button
                     type="button"
                     onClick={startRecording}
-                    className="flex h-10 items-center gap-2 rounded-lg bg-rose-600 px-4 text-xs font-medium text-white transition-colors hover:bg-rose-700 whitespace-nowrap shrink-0"
+                    aria-label="Start recording"
+                    title="Start recording"
+                    className="flex h-14 w-14 items-center justify-center rounded-full border-[4px] border-white bg-gradient-to-b from-[#22c3ff] via-[#126cf1] to-[#0838b5] text-white shadow-[0_0_26px_rgba(29,110,242,0.65)] transition-transform hover:scale-105 active:scale-95 dark:border-[#07090e]"
                   >
-                    <Mic className="h-3.5 w-3.5" />
-                    <span>Start Recording</span>
+                    <Mic className="h-5 w-5" />
                   </button>
                 )}
               </div>
+
+              {/* Right Capsule Button (icon-only) */}
+              {hasPlayerForActiveSession ? (
+                <button
+                  type="button"
+                  onClick={detachUploadedAudio}
+                  aria-label="Close audio"
+                  title="Close audio"
+                  className="flex h-10 w-20 items-center justify-center rounded-full border border-slate-300/80 bg-slate-100/80 text-slate-700 transition-colors hover:border-sky-400/60 hover:bg-slate-200/70 sm:w-28 dark:border-white/25 dark:bg-white/[0.03] dark:text-slate-100 dark:hover:border-white/50 dark:hover:bg-white/[0.08]"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              ) : isActiveLive ? (
+                <button
+                  type="button"
+                  onClick={handleCopyAll}
+                  disabled={activeSession.segments.length === 0}
+                  aria-label="Copy transcript"
+                  title="Copy transcript"
+                  className="flex h-10 w-20 items-center justify-center rounded-full border border-slate-300/80 bg-slate-100/80 text-slate-700 transition-colors hover:border-sky-400/60 hover:bg-slate-200/70 disabled:opacity-40 sm:w-28 dark:border-white/25 dark:bg-white/[0.03] dark:text-slate-100 dark:hover:border-white/50 dark:hover:bg-white/[0.08]"
+                >
+                  {copiedAll ? (
+                    <Check className="h-4 w-4 text-emerald-400" />
+                  ) : (
+                    <Copy className="h-4 w-4" />
+                  )}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setIsUploadOpen(true)}
+                  aria-label="Upload audio"
+                  title="Upload audio"
+                  className="flex h-10 w-20 items-center justify-center rounded-full border border-slate-300/80 bg-slate-100/80 text-slate-700 transition-colors hover:border-sky-400/60 hover:bg-slate-200/70 sm:w-28 dark:border-white/25 dark:bg-white/[0.03] dark:text-slate-100 dark:hover:border-white/50 dark:hover:bg-white/[0.08]"
+                >
+                  <FileAudio className="h-4 w-4" />
+                </button>
+              )}
             </div>
-          )}
+          </div>
         </footer>
       </main>
 

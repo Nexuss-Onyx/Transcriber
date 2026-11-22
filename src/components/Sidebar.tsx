@@ -1,5 +1,16 @@
 import { useState, type FormEvent } from "react";
-import { Plus, Trash2, X, SlidersHorizontal, FileAudio } from "lucide-react";
+import {
+  AudioLines,
+  AudioWaveform,
+  FileAudio,
+  Globe,
+  Mic,
+  Plus,
+  Sparkles,
+  Tag,
+  Trash2,
+  X,
+} from "lucide-react";
 import {
   LANGUAGE_OPTIONS,
   type ConnectionState,
@@ -7,15 +18,18 @@ import {
   type TranscriptionMode,
   type TranscriptionSession,
 } from "../types/transcribe";
-import { countWords, formatDuration } from "../utils/audioCapture";
+import { formatDuration } from "../utils/audioCapture";
 
 interface SidebarProps {
   sessions: TranscriptionSession[];
   activeSessionId: string;
   connectionState: ConnectionState;
   config: TranscriptionConfig;
-  isOpenMobile: boolean;
-  onCloseMobile: () => void;
+  isOpen: boolean;
+  audioDevices: MediaDeviceInfo[];
+  selectedDeviceId: string;
+  onSelectDevice: (deviceId: string) => void;
+  onClose: () => void;
   onSelectSession: (id: string) => void;
   onNewSession: () => void;
   onDeleteSession: (id: string) => void;
@@ -28,8 +42,11 @@ export function Sidebar({
   activeSessionId,
   connectionState,
   config,
-  isOpenMobile,
-  onCloseMobile,
+  isOpen,
+  audioDevices,
+  selectedDeviceId,
+  onSelectDevice,
+  onClose,
   onSelectSession,
   onNewSession,
   onDeleteSession,
@@ -67,83 +84,73 @@ export function Sidebar({
 
   return (
     <>
-      {isOpenMobile && (
+      {isOpen && (
         <div
-          onClick={onCloseMobile}
-          className="fixed inset-0 z-30 bg-slate-950/40 backdrop-blur-[1px] lg:hidden"
+          onClick={onClose}
+          className="fixed inset-0 z-30 bg-black/50 backdrop-blur-xs transition-opacity"
         />
       )}
       <aside
-        className={`fixed inset-y-0 left-0 z-40 flex w-[276px] shrink-0 flex-col border-r border-slate-200 bg-white transition-transform duration-200 dark:border-slate-800 dark:bg-slate-900 lg:static lg:translate-x-0 ${
-          isOpenMobile ? "translate-x-0" : "-translate-x-full"
+        aria-hidden={!isOpen}
+        className={`fixed inset-y-3 left-3 z-40 flex w-[236px] flex-col rounded-[24px] border border-slate-200/80 bg-white/90 text-slate-800 shadow-2xl backdrop-blur-2xl transition-transform duration-200 dark:border-white/12 dark:bg-[#081126]/92 dark:text-slate-100 ${
+          isOpen
+            ? "translate-x-0"
+            : "-translate-x-[calc(100%+24px)] pointer-events-none"
         }`}
       >
-        {/* Brand header */}
-        <div className="flex h-14 items-center justify-between border-b border-slate-200 px-4 dark:border-slate-800">
-          <span className="font-display text-base font-semibold tracking-tight text-slate-900 dark:text-slate-100 whitespace-nowrap shrink-0">
-            Transcribe Live
-          </span>
+        {/* Top icon-only action strip */}
+        <div className="flex items-center justify-between border-b border-slate-200/70 px-3 py-3 dark:border-white/10">
+          <div className="flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => {
+                onNewSession();
+                onClose();
+              }}
+              disabled={isRecording}
+              aria-label="New session"
+              title="New session"
+              className="flex h-10 w-10 items-center justify-center rounded-full border border-slate-300/80 bg-slate-900 text-white transition-colors hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-45 dark:border-white/15 dark:bg-white/10 dark:hover:bg-white/20"
+            >
+              <Plus className="h-4 w-4" />
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                onOpenUploadModal();
+                onClose();
+              }}
+              disabled={isRecording}
+              aria-label="Upload audio"
+              title="Upload audio"
+              className="flex h-10 w-10 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-700 transition-colors hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-45 dark:border-white/15 dark:bg-white/[0.04] dark:text-slate-200 dark:hover:bg-white/15"
+            >
+              <FileAudio className="h-4 w-4" />
+            </button>
+          </div>
           <button
             type="button"
-            onClick={onCloseMobile}
-            aria-label="Close sidebar"
-            className="flex h-8 w-8 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-100 lg:hidden"
+            onClick={onClose}
+            aria-label="Close drawer"
+            title="Close drawer"
+            className="flex h-9 w-9 items-center justify-center rounded-full text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-white/10 dark:hover:text-white"
           >
             <X className="h-4 w-4" />
           </button>
         </div>
 
-        {/* Primary session actions */}
-        <div className="flex flex-col gap-2 border-b border-slate-200 p-3 dark:border-slate-800">
-          <button
-            type="button"
-            onClick={() => {
-              onNewSession();
-              onCloseMobile();
-            }}
-            disabled={isRecording}
-            className="flex h-10 w-full items-center justify-center gap-2 rounded-lg bg-slate-900 px-4 text-sm font-medium text-white transition-colors hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-200 whitespace-nowrap shrink-0"
-          >
-            <Plus className="h-4 w-4" />
-            <span>New Session</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              onOpenUploadModal();
-              onCloseMobile();
-            }}
-            disabled={isRecording}
-            className="flex h-9 w-full items-center justify-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800 whitespace-nowrap shrink-0"
-          >
-            <FileAudio className="h-3.5 w-3.5" />
-            <span>Transcribe Audio File</span>
-          </button>
-        </div>
-
-        {/* Sessions list */}
-        <div className="flex-1 overflow-y-auto px-3 py-3">
-          <div className="mb-2 px-1 text-xs font-medium text-slate-500 dark:text-slate-400">
-            Recent Sessions
-          </div>
+        {/* Sessions list (icon + numeric duration only) */}
+        <div className="flex-1 overflow-y-auto px-2.5 py-2.5">
           <div className="space-y-1">
             {sessions.map((s) => {
               const isActive = s.id === activeSessionId;
-              const words = s.segments.reduce(
-                (acc, seg) => acc + countWords(seg.text),
-                0
-              );
-              const dateLabel = new Date(s.updatedAt).toLocaleDateString(
-                undefined,
-                { month: "short", day: "numeric" }
-              );
               return (
                 <div
                   key={s.id}
-                  className={`group flex items-center justify-between rounded-lg px-2.5 py-2 transition-colors ${
+                  className={`group flex items-center justify-between rounded-2xl px-2.5 py-2 transition-colors ${
                     isActive
-                      ? "bg-slate-100 text-slate-900 dark:bg-slate-800 dark:text-slate-100"
-                      : "text-slate-600 hover:bg-slate-50 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-slate-800/60 dark:hover:text-slate-100"
+                      ? "bg-sky-500/12 text-sky-700 ring-1 ring-sky-500/30 dark:bg-sky-400/15 dark:text-sky-200 dark:ring-sky-400/25"
+                      : "text-slate-600 hover:bg-slate-100/80 dark:text-slate-300 dark:hover:bg-white/[0.06]"
                   }`}
                 >
                   <button
@@ -151,22 +158,17 @@ export function Sidebar({
                     onClick={() => {
                       if (!isRecording) {
                         onSelectSession(s.id);
-                        onCloseMobile();
+                        onClose();
                       }
                     }}
                     disabled={isRecording && !isActive}
-                    className="min-w-0 flex-1 text-left focus-visible:outline-none"
+                    aria-label={`Select session ${s.id}`}
+                    className="flex min-w-0 flex-1 items-center gap-2.5 text-left focus-visible:outline-none"
                   >
-                    <div className="truncate text-sm font-medium">
-                      {s.title || "Untitled Session"}
-                    </div>
-                    <div className="mt-0.5 flex items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400 tabular-nums">
-                      <span>{dateLabel}</span>
-                      <span aria-hidden="true">·</span>
-                      <span>{formatDuration(s.durationMs)}</span>
-                      <span aria-hidden="true">·</span>
-                      <span>{words} words</span>
-                    </div>
+                    <AudioLines className="h-4 w-4 shrink-0 opacity-75" />
+                    <span className="font-mono text-xs tabular-nums opacity-85">
+                      {formatDuration(s.durationMs)}
+                    </span>
                   </button>
                   {sessions.length > 1 && (
                     <button
@@ -178,8 +180,9 @@ export function Sidebar({
                         }
                       }}
                       disabled={isRecording && isActive}
-                      aria-label={`Delete ${s.title}`}
-                      className="ml-1 flex h-7 w-7 shrink-0 items-center justify-center rounded text-slate-400 opacity-0 transition-opacity hover:bg-slate-200 hover:text-rose-600 group-hover:opacity-100 disabled:pointer-events-none dark:hover:bg-slate-700 dark:hover:text-rose-400"
+                      aria-label={`Delete session ${s.id}`}
+                      title="Delete session"
+                      className="ml-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-slate-400 opacity-0 transition-opacity hover:bg-rose-500/15 hover:text-rose-500 group-hover:opacity-100 focus-visible:opacity-100 disabled:pointer-events-none"
                     >
                       <Trash2 className="h-3.5 w-3.5" />
                     </button>
@@ -190,136 +193,141 @@ export function Sidebar({
           </div>
         </div>
 
-        {/* Engine configuration */}
-        <div className="border-t border-slate-200 p-3.5 dark:border-slate-800">
-          <div className="mb-3 flex items-center justify-between">
-            <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200">
-              <SlidersHorizontal className="h-3.5 w-3.5 text-slate-500" />
-              <span>Engine Settings</span>
-            </div>
-            {isRecording && (
-              <span className="text-[11px] font-medium text-amber-600 dark:text-amber-400">
-                Locked while live
-              </span>
-            )}
+        {/* Icon-driven engine controls */}
+        <div className="space-y-2.5 border-t border-slate-200/70 p-3 dark:border-white/10">
+          {/* Verbatim / Smart Clean icon switch */}
+          <div className="grid grid-cols-2 gap-1 rounded-full border border-slate-200/80 bg-slate-100/80 p-1 dark:border-white/10 dark:bg-white/[0.04]">
+            <button
+              type="button"
+              disabled={isRecording}
+              onClick={() => handleModeChange("VERBATIM")}
+              aria-label="Verbatim mode"
+              title="Verbatim mode"
+              className={`flex h-9 items-center justify-center rounded-full transition-colors ${
+                config.mode === "VERBATIM"
+                  ? "bg-white text-sky-600 shadow-xs dark:bg-sky-500/25 dark:text-sky-200"
+                  : "text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-white"
+              } disabled:cursor-not-allowed`}
+            >
+              <AudioWaveform className="h-4 w-4" />
+            </button>
+            <button
+              type="button"
+              disabled={isRecording}
+              onClick={() => handleModeChange("SMART")}
+              aria-label="Smart clean mode"
+              title="Smart clean mode"
+              className={`flex h-9 items-center justify-center rounded-full transition-colors ${
+                config.mode === "SMART"
+                  ? "bg-white text-sky-600 shadow-xs dark:bg-sky-500/25 dark:text-sky-200"
+                  : "text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-white"
+              } disabled:cursor-not-allowed`}
+            >
+              <Sparkles className="h-4 w-4" />
+            </button>
           </div>
 
-          <div className="space-y-3">
-            {/* Mode segmented control */}
-            <div>
-              <div className="mb-1.5 text-xs text-slate-500 dark:text-slate-400">
-                Transcription Mode
-              </div>
-              <div className="grid grid-cols-2 gap-1 rounded-lg bg-slate-100 p-1 dark:bg-slate-800">
-                <button
-                  type="button"
-                  disabled={isRecording}
-                  onClick={() => handleModeChange("VERBATIM")}
-                  className={`rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
-                    config.mode === "VERBATIM"
-                      ? "bg-white text-slate-900 shadow-xs dark:bg-slate-700 dark:text-slate-100"
-                      : "text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-100"
-                  } disabled:cursor-not-allowed`}
+          {/* Language code selector (icon + compact ISO code) */}
+          <div className="flex items-center gap-2 rounded-full border border-slate-200/80 bg-slate-100/70 px-3 dark:border-white/12 dark:bg-white/[0.04]">
+            <Globe className="h-3.5 w-3.5 shrink-0 text-sky-500 dark:text-sky-300" />
+            <select
+              id="language-select"
+              aria-label="Language"
+              disabled={isRecording}
+              value={config.languageCode}
+              onChange={(e) =>
+                onUpdateConfig({ languageCode: e.target.value })
+              }
+              className="h-9 w-full bg-transparent font-mono text-xs text-slate-800 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60 dark:text-slate-100"
+            >
+              {LANGUAGE_OPTIONS.map((opt) => (
+                <option
+                  key={opt.code}
+                  value={opt.code}
+                  className="bg-white text-slate-900 dark:bg-[#081126] dark:text-slate-100"
                 >
-                  Verbatim
-                </button>
-                <button
-                  type="button"
-                  disabled={isRecording}
-                  onClick={() => handleModeChange("SMART")}
-                  className={`rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
-                    config.mode === "SMART"
-                      ? "bg-white text-slate-900 shadow-xs dark:bg-slate-700 dark:text-slate-100"
-                      : "text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-100"
-                  } disabled:cursor-not-allowed`}
-                >
-                  Smart Clean
-                </button>
-              </div>
-            </div>
+                  {opt.code.toUpperCase()}
+                </option>
+              ))}
+            </select>
+          </div>
 
-            {/* Language hint */}
-            <div>
-              <label
-                htmlFor="language-select"
-                className="mb-1 block text-xs text-slate-500 dark:text-slate-400"
-              >
-                Language
-              </label>
+          {/* Mic device selector when available */}
+          {audioDevices.length > 0 && (
+            <div className="flex items-center gap-2 rounded-full border border-slate-200/80 bg-slate-100/70 px-3 dark:border-white/12 dark:bg-white/[0.04]">
+              <Mic className="h-3.5 w-3.5 shrink-0 text-slate-500 dark:text-slate-300" />
               <select
-                id="language-select"
+                aria-label="Microphone input device"
                 disabled={isRecording}
-                value={config.languageCode}
-                onChange={(e) =>
-                  onUpdateConfig({ languageCode: e.target.value })
-                }
-                className="h-9 w-full rounded-lg border border-slate-200 bg-white px-2.5 text-xs text-slate-800 focus:border-slate-400 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
+                value={selectedDeviceId}
+                onChange={(e) => onSelectDevice(e.target.value)}
+                className="h-9 w-full truncate bg-transparent font-mono text-xs text-slate-800 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60 dark:text-slate-100"
               >
-                {LANGUAGE_OPTIONS.map((opt) => (
-                  <option key={opt.code} value={opt.code}>
-                    {opt.label}
+                <option
+                  value=""
+                  className="bg-white text-slate-900 dark:bg-[#081126] dark:text-slate-100"
+                >
+                  #0
+                </option>
+                {audioDevices.map((dev, i) => (
+                  <option
+                    key={dev.deviceId || i}
+                    value={dev.deviceId}
+                    className="bg-white text-slate-900 dark:bg-[#081126] dark:text-slate-100"
+                  >
+                    #{i + 1}
                   </option>
                 ))}
               </select>
-              {config.languageCode === "am-ET" && (
-                <p className="mt-1 text-[11px] leading-snug text-rose-600 dark:text-rose-400">
-                  Amharic focus active (am-ET · Ethiopic script)
-                </p>
-              )}
             </div>
+          )}
 
-            {config.mode === "SMART" && (
-              <p className="text-[11px] leading-snug text-slate-500 dark:text-slate-400">
-                Smart Clean removes filler words and formats speech into clean prose.
-              </p>
-            )}
+          {/* Custom vocabulary icon-only input */}
+          <form onSubmit={handleAddVocab} className="flex items-center gap-1.5">
+            <div className="flex min-w-0 flex-1 items-center gap-1.5 rounded-full border border-slate-200/80 bg-slate-100/70 px-3 dark:border-white/12 dark:bg-white/[0.04]">
+              <Tag className="h-3.5 w-3.5 shrink-0 text-slate-400" />
+              <input
+                type="text"
+                aria-label="Custom vocabulary term"
+                value={vocabInput}
+                disabled={isRecording}
+                onChange={(e) => setVocabInput(e.target.value)}
+                className="h-9 min-w-0 flex-1 bg-transparent text-xs text-slate-800 focus:outline-none disabled:opacity-60 dark:text-slate-100"
+              />
+            </div>
+            <button
+              type="submit"
+              aria-label="Add custom vocabulary term"
+              title="Add custom vocabulary term"
+              disabled={isRecording || !vocabInput.trim()}
+              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-slate-200/80 bg-slate-100/80 text-slate-700 hover:bg-slate-200 disabled:opacity-40 dark:border-white/12 dark:bg-white/[0.06] dark:text-slate-200 dark:hover:bg-white/15"
+            >
+              <Plus className="h-3.5 w-3.5" />
+            </button>
+          </form>
 
-            {/* Custom Vocabulary */}
-            <div>
-              <div className="mb-1 text-xs text-slate-500 dark:text-slate-400">
-                Custom vocabulary
-              </div>
-              <form onSubmit={handleAddVocab} className="flex gap-1.5">
-                <input
-                  type="text"
-                  value={vocabInput}
-                  disabled={isRecording}
-                  onChange={(e) => setVocabInput(e.target.value)}
-                  placeholder="Add term or name..."
-                  className="h-8 min-w-0 flex-1 rounded-md border border-slate-200 bg-white px-2.5 text-xs text-slate-800 placeholder:text-slate-400 focus:border-slate-400 focus:outline-none disabled:opacity-60 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
-                />
-                <button
-                  type="submit"
-                  disabled={isRecording || !vocabInput.trim()}
-                  className="h-8 rounded-md border border-slate-200 bg-slate-50 px-2.5 text-xs font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700 whitespace-nowrap shrink-0"
+          {config.customVocabulary.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 pt-0.5 text-xs text-slate-600 dark:text-slate-300">
+              {config.customVocabulary.map((term) => (
+                <span
+                  key={term}
+                  className="inline-flex items-center gap-1 rounded-full border border-slate-200/70 px-2 py-0.5 dark:border-white/15"
                 >
-                  Add
-                </button>
-              </form>
-              {config.customVocabulary.length > 0 && (
-                <div className="mt-2 flex flex-wrap gap-x-2.5 gap-y-1 text-xs text-slate-600 dark:text-slate-300">
-                  {config.customVocabulary.map((term) => (
-                    <span
-                      key={term}
-                      className="inline-flex items-center gap-1 underline decoration-slate-300 underline-offset-2 dark:decoration-slate-600"
+                  <span className="max-w-[120px] truncate">{term}</span>
+                  {!isRecording && (
+                    <button
+                      type="button"
+                      onClick={() => handleRemoveVocab(term)}
+                      aria-label={`Remove ${term}`}
+                      className="text-slate-400 hover:text-rose-400"
                     >
-                      <span>{term}</span>
-                      {!isRecording && (
-                        <button
-                          type="button"
-                          onClick={() => handleRemoveVocab(term)}
-                          aria-label={`Remove ${term}`}
-                          className="text-slate-400 hover:text-rose-600 dark:hover:text-rose-400"
-                        >
-                          <X className="h-3 w-3" />
-                        </button>
-                      )}
-                    </span>
-                  ))}
-                </div>
-              )}
+                      <X className="h-3 w-3" />
+                    </button>
+                  )}
+                </span>
+              ))}
             </div>
-          </div>
+          )}
         </div>
       </aside>
     </>

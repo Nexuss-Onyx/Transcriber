@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <rect x="16" y="16" width="480" height="480" rx="116" fill="#07080A" />
+  <rect x="16" y="16" width="480" height="480" rx="116" stroke="#FFFFFF" stroke-opacity="0.14" stroke-width="6" />
+
+  <!-- Subtle outer monochrome orbital resonance arc -->
+  <path
+    d="M114 214 A148 148 0 0 1 384 178"
+    stroke="#FFFFFF"
+    stroke-opacity="0.22"
+    stroke-width="20"
+    stroke-linecap="round"
+  />
+  <path
+    d="M398 298 A148 148 0 0 1 128 334"
+    stroke="#FFFFFF"
+    stroke-opacity="0.14"
+    stroke-width="20"
+    stroke-linecap="round"
+  />
+
+  <!-- Abstract monochrome harmonic crest (5 sculpted geometric bars) -->
+  <rect x="128" y="218" width="34" height="92" rx="17" fill="#71717A" />
+  <rect x="184" y="156" width="34" height="200" rx="17" fill="#D4D4D8" />
+  <rect x="240" y="112" width="36" height="260" rx="18" fill="#FFFFFF" />
+  <rect x="298" y="168" width="34" height="176" rx="17" fill="#D4D4D8" />
+  <rect x="354" y="210" width="34" height="106" rx="17" fill="#71717A" />
+
+  <!-- Sculpted monochrome focal wave ribbon -->
+  <path
+    d="M108 326 C158 326, 178 258, 224 258 C264 258, 272 340, 314 340 C350 340, 370 288, 404 288"
+    stroke="#07080A"
+    stroke-width="40"
+    stroke-linecap="round"
+  />
+  <path
+    d="M108 326 C158 326, 178 258, 224 258 C264 258, 272 340, 314 340 C350 340, 370 288, 404 288"
+    stroke="#FFFFFF"
+    stroke-width="22"
+    stroke-linecap="round"
+  />
+</svg>
