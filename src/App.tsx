@@ -113,23 +113,14 @@ async function transcribeWavWorker(params: {
     return { text: "" };
   }
   try {
-    const res = await fetch("/api/transcribe-audio", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        wavBase64: params.wavBase64,
-        languageCode: params.languageCode,
-        customVocabulary: params.customVocabulary,
-        mode: params.mode,
-      }),
-      signal: params.signal,
+    const data = await (await import("./utils/geminiDirect")).transcribeAudio({
+      wavBase64: params.wavBase64,
+      languageCode: params.languageCode,
+      customVocabulary: params.customVocabulary,
+      mode: params.mode,
     });
-    const data = (await res.json().catch(() => ({}))) as {
-      text?: string;
-      error?: string;
-    };
-    if (!res.ok) {
-      const errMsg = data.error || `Static transcription failed (${res.status}).`;
+    if (data.error) {
+      const errMsg = data.error;
       if (isFatalConfigErrorMessage(errMsg)) {
         return { text: "", fatalError: errMsg };
       }
@@ -452,76 +443,10 @@ export default function App() {
           );
 
           try {
-            const res = await fetch("/api/refine-transcript", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                windows: batch,
-                priorContext,
-                languageCode: lp.configSnapshot.languageCode,
-                customVocabulary: lp.configSnapshot.customVocabulary,
-                scope: "live_6w",
-              }),
-              signal,
-            });
-            if (!res.ok) continue;
-
-            const data = (await res.json()) as {
-              refinedWindows?: Array<{
-                windowIndex: number;
-                refinedText: string;
-                detectedLanguage?: string;
-              }>;
-            };
-
-            if (
-              signal.aborted ||
-              lp.runId !== runId ||
-              !Array.isArray(data.refinedWindows) ||
-              data.refinedWindows.length === 0
-            ) {
-              continue;
-            }
-
-            for (const item of data.refinedWindows) {
-              const winEntry = lp.structuredWindows.get(item.windowIndex);
-              if (winEntry) {
-                winEntry.lmRefined = true;
-                winEntry.audioAttachment = undefined;
-              }
-            }
-
-            const fallbackLang =
-              lp.lockedAutoLang ??
-              (lp.configSnapshot.languageCode === "auto"
-                ? undefined
-                : lp.configSnapshot.languageCode);
-
-            const detectedFromLm = data.refinedWindows
-              .map((w) => w.detectedLanguage)
-              .filter((l): l is string => Boolean(l));
-
-            updateSessionById(targetSessionId, (s) => {
-              let mergedLangs = s.detectedLanguages;
-              for (const nl of detectedFromLm) {
-                if (!mergedLangs.includes(nl)) {
-                  mergedLangs = [...mergedLangs, nl];
-                }
-              }
-              return {
-                ...s,
-                segments: applyLmRefinedWindowsToSegments(
-                  s.segments,
-                  lp.structuredWindows,
-                  data.refinedWindows!,
-                  fallbackLang
-                ),
-                detectedLanguages: mergedLangs,
-                updatedAt: Date.now(),
-              };
-            });
+            // Refinement skipped in client-side mode (no backend).
+            continue;
           } catch {
-            // Stay silent under the hood; keep unrefined windows queued for next pass
+            // Stay silent
           }
         }
       };
@@ -2337,73 +2262,10 @@ export default function App() {
             );
 
             try {
-              const res = await fetch("/api/refine-transcript", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  windows: due,
-                  priorContext,
-                  languageCode: cfg.languageCode,
-                  customVocabulary: cfg.customVocabulary,
-                  scope: "upload_5w",
-                }),
-                signal: abortController.signal,
-              });
-              if (!res.ok) return;
-
-              const data = (await res.json()) as {
-                refinedWindows?: Array<{
-                  windowIndex: number;
-                  refinedText: string;
-                  detectedLanguage?: string;
-                }>;
-              };
-
-              if (
-                abortController.signal.aborted ||
-                !Array.isArray(data.refinedWindows) ||
-                data.refinedWindows.length === 0
-              ) {
-                return;
-              }
-
-              for (const item of data.refinedWindows) {
-                const entry = uploadStructuredWindows.get(item.windowIndex);
-                if (entry) {
-                  entry.lmRefined = true;
-                  entry.audioAttachment = undefined;
-                }
-              }
-
-              const fallbackLang =
-                lockedAutoLang ??
-                (cfg.languageCode === "auto" ? undefined : cfg.languageCode);
-
-              const detectedFromLm = data.refinedWindows
-                .map((w) => w.detectedLanguage)
-                .filter((l): l is string => Boolean(l));
-
-              updateSessionById(newSession.id, (s) => {
-                let mergedLangs = s.detectedLanguages;
-                for (const nl of detectedFromLm) {
-                  if (!mergedLangs.includes(nl)) {
-                    mergedLangs = [...mergedLangs, nl];
-                  }
-                }
-                return {
-                  ...s,
-                  segments: applyLmRefinedChunksToSegments(
-                    s.segments,
-                    uploadStructuredWindows,
-                    data.refinedWindows!,
-                    fallbackLang
-                  ),
-                  detectedLanguages: mergedLangs,
-                  updatedAt: Date.now(),
-                };
-              });
+              // Refinement skipped in client-side mode (no backend).
+              return;
             } catch {
-              // Silent under the hood; pending chunks stay queued for next minute/flush
+              // Silent
             }
           };
 

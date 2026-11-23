@@ -42,14 +42,12 @@ export function NotesPanel({ session, onSaveNotes }: NotesPanelProps) {
     setError(null);
     setIsLoading(true);
     try {
-      const res = await fetch("/api/analyze", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ transcript: fullTranscript, task }),
+      const data = await (await import("../utils/geminiDirect")).analyzeTranscript({
+        transcript: fullTranscript,
+        task,
       });
-      const data = (await res.json()) as { result?: string; error?: string };
-      if (!res.ok) {
-        throw new Error(data.error || "Failed to generate analysis.");
+      if (data.error) {
+        throw new Error(data.error);
       }
       onSaveNotes({
         ...session.notes,
